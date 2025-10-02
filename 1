@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VOO 即時股價 | Vanguard S&P 500 ETF</title>
+    <meta name="description" content="一頁式網站，使用 TradingView 小工具顯示 Vanguard S&P 500 ETF（VOO）即時圖表與報價。可直接部署到 GitHub Pages。" />
+    <meta name="robots" content="index,follow" />
+    <link rel="preconnect" href="https://s3.tradingview.com" />
+    <link rel="preconnect" href="https://www.tradingview.com" />
+    <style>
+      :root{
+        --bg: #0b0f19; /* 深色背景 */
+        --card: #121829;
+        --text: #e6e6e6;
+        --muted: #9aa4bf;
+        --accent: #6aa9ff;
+      }
+      * { box-sizing: border-box; }
+      body{
+        margin:0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Noto Sans TC", Helvetica, Arial;
+        background: linear-gradient(180deg, #0b0f19 0%, #0e1324 60%, #0b0f19 100%);
+        color: var(--text);
+      }
+      header{
+        max-width: 1100px; margin: 32px auto 16px; padding: 0 20px;
+        display:flex; align-items:center; gap:14px; flex-wrap: wrap;
+      }
+      .logo{
+        width: 40px; height: 40px; border-radius: 10px; background: #1b2342; display:grid; place-items:center; color:#9cc0ff; font-weight:700;
+        box-shadow: 0 6px 18px rgba(0,0,0,.35), inset 0 0 12px rgba(106,169,255,.2);
+      }
+      h1{ font-size: clamp(20px, 2.2vw, 28px); margin: 0; letter-spacing:.3px; }
+      .sub{ color: var(--muted); font-size: 14px; }
+      .card{
+        max-width: 1100px; margin: 12px auto 24px; padding: 20px; border-radius: 16px; background: rgba(18,24,41,.7);
+        box-shadow: 0 20px 45px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.04);
+      }
+      .grid{ display:grid; grid-template-columns: 1fr; gap: 16px; }
+      @media (min-width: 900px){ .grid{ grid-template-columns: 2fr 1fr; } }
+      .panel{
+        background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06); border-radius: 14px; padding: 14px;
+      }
+      .panel h2{ font-size: 16px; margin:0 0 8px; color:#c9d6ff; }
+      footer{ text-align:center; color:var(--muted); font-size:12px; padding: 24px 0 36px; }
+      a{ color: var(--accent); text-decoration: none; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div class="logo">VOO</div>
+      <div>
+        <h1>Vanguard S&P 500 ETF（VOO）股價與走勢</h1>
+        <div class="sub">資料來源：TradingView 小工具（僅供參考，非投資建議）。</div>
+      </div>
+    </header>
+
+    <main class="card">
+      <div class="grid">
+        <!-- 主圖：TradingView 圖表 -->
+        <section class="panel">
+          <h2>即時圖表</h2>
+          <!-- TradingView Widget BEGIN -->
+          <div class="tradingview-widget-container">
+            <div id="tradingview_chart" style="height:540px"></div>
+          </div>
+          <script type="text/javascript" src="https://s3.tradingview.com/tv.js" defer></script>
+          <script>
+            window.addEventListener('load', function(){
+              if (typeof TradingView !== 'undefined') {
+                new TradingView.widget({
+                  "container_id": "tradingview_chart",
+                  "width": "100%",
+                  "height": 540,
+                  "symbol": "AMEX:VOO",    // 亦可改成 "NYSEARCA:VOO"
+                  "interval": "60",
+                  "timezone": "Etc/UTC",
+                  "theme": "dark",
+                  "style": "1",
+                  "locale": "zh_TW",
+                  "enable_publishing": false,
+                  "allow_symbol_change": true,
+                  "hide_legend": false,
+                  "hide_top_toolbar": false,
+                  "hide_side_toolbar": false,
+                  "withdateranges": true,
+                  "details": true,
+                  "calendar": true,
+                  "support_host": "https://www.tradingview.com"
+                });
+              }
+            });
+          </script>
+          <!-- TradingView Widget END -->
+        </section>
+
+        <!-- 側欄：小工具與連結 -->
+        <aside class="panel">
+          <h2>報價與資訊</h2>
+          <!-- 迷你報價卡 -->
+          <div class="tradingview-widget-container" style="margin-bottom:12px">
+            <div id="tradingview_ticker"></div>
+            <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-mini-symbol-overview.js" async>
+            {
+              "symbol": "AMEX:VOO",
+              "width": "100%",
+              "height": "220",
+              "locale": "zh_TW",
+              "dateRange": "1M",
+              "colorTheme": "dark",
+              "isTransparent": true,
+              "autosize": true
+            }
+            </script>
+          </div>
+
+          <div style="font-size:14px; line-height:1.6">
+            <div>快速連結：</div>
+            <ul>
+              <li><a href="https://www.tradingview.com/symbols/VOO/" target="_blank" rel="noopener">TradingView：VOO</a></li>
+              <li><a href="https://finance.yahoo.com/quote/VOO" target="_blank" rel="noopener">Yahoo Finance：VOO</a></li>
+              <li><a href="https://investor.vanguard.com/investment-products/etfs/profile/voo" target="_blank" rel="noopener">Vanguard 官方頁面</a></li>
+            </ul>
+          </div>
+        </aside>
+      </div>
+    </main>
+
+    <footer>
+      本頁僅供教育與示範，不構成投資建議。© <span id="y"></span> Your Name
+    </footer>
+
+    <script>
+      // 動態年份
+      document.getElementById('y').textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>
