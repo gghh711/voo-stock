@@ -192,6 +192,61 @@ def backtest_all_windows(closes, dates):
         results[win] = backtest_direction(closes, dates, win)
     return results
 
+def simulate_trading(signals, logic, capital, min_duration):
+    cash = float(capital)
+    trades = []
+    equity_curve = []
+    peak = cash
+    max_dd = 0.0
+    idle_days = 0
+    prev_exit_date = signals[0]["entry_date"] if signals else None
+
+    for sig in signals:
+        dur = sig["duration"]
+        if dur < min_duration:
+            continue
+        try:
+            gap = (datetime.datetime.strptime(sig["entry_date"], "%Y-%m-%d") -
+                   datetime.datetime.strptime(prev_exit_date, "%Y-%m-%d")).days
+            idle_days += max(0, gap)
+        except: pass
+
+        chg = sig["price_chg"] / 100.0
+        sig_type = sig["type"]
+
+        if logic == "long":
+            if "負轉正" in sig_type:
+                ret = chg
+            else:
+                equity_curve.append({"date": sig["entry_date"], "val": cash})
+                equity_curve.append({"date": sig["exit_date"],  "val": cash})
+                prev_exit_date = sig["exit_date"]
+                continue
+        else:
+            ret = chg if "負轉正" in sig_type else -chg
+
+        prev_cash = cash
+        cash = cash * (1 + ret)
+        peak = max(peak, cash)
+        dd = (peak - cash) / peak * 100
+        max_dd = max(max_dd, dd)
+        trades.append({"date": sig["entry_date"], "ret": ret * 100, "win": ret > 0})
+        equity_curve.append({"date": sig["entry_date"], "val": prev_cash})
+        equity_curve.append({"date": sig["exit_date"],  "val": cash})
+        prev_exit_date = sig["exit_date"]
+
+    wins = sum(1 for t in trades if t["win"])
+    wr = round(wins / len(trades) * 100) if trades else 0
+    return {
+        "final_val":   round(cash, 2),
+        "total_ret":   round((cash - capital) / capital * 100, 2),
+        "trade_count": len(trades),
+        "win_rate":    wr,
+        "max_dd":      round(max_dd, 1),
+        "idle_days":   idle_days,
+        "equity":      equity_curve,
+    }
+
 def sma(closes, w):
     out = [None] * len(closes)
     for i in range(w-1, len(closes)):
@@ -762,9 +817,91 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
                          "padding":"12px","marginTop":"4px"}),
             ])
 
+            # ── 模擬交易區塊 ──
+            sim_all = best_res["signals"]
+            if sim_all:
+                first_price = sim_all[0]["entry_price"]
+                last_price  = sim_all[-1]["exit_price"]
+                bah_ret     = round((last_price - first_price) / first_price * 100, 2)
+                init_capital = 100000  # 固定10萬模擬
+
+                sim_rows_long = []
+                sim_rows_both = []
+                best_sim_long = None
+                best_sim_both = None
+                for min_d in range(1, 11):
+                    r_long = simulate_trading(sim_all, "long", init_capital, min_d)
+                    r_both = simulate_trading(sim_all, "both", init_capital, min_d)
+                    sim_rows_long.append((min_d, r_long))
+                    sim_rows_both.append((min_d, r_both))
+                    if best_sim_long is None or r_long["final_val"] > best_sim_long[1]["final_val"]:
+                        best_sim_long = (min_d, r_long)
+                    if best_sim_both is None or r_both["final_val"] > best_sim_both[1]["final_val"]:
+                        best_sim_both = (min_d, r_both)
+
+                bah_final = round(init_capital * (1 + bah_ret/100), 0)
+
+                def sim_row_html(min_d, r, is_best):
+                    ret_color = "#0F6E56" if r["total_ret"] >= 0 else "#A32D2D"
+                    style = {"fontWeight":"500","color":"#0F6E56"} if is_best else {}
+                    td = lambda v, s={}: html.Td(v, style={"padding":"4px 8px",**s})
+                    return html.Tr([
+                        td(f"≥{min_d} 天", style),
+                        td(f"{r['final_val']/10000:.2f} 萬", {**style,"color":ret_color}),
+                        td(f"{'+' if r['total_ret']>=0 else ''}{r['total_ret']}%", {"color":ret_color}),
+                        td(f"{r['trade_count']} 筆"),
+                        td(f"{r['win_rate']}%"),
+                        td(f"-{r['max_dd']}%", {"color":"#A32D2D"}),
+                        td(f"{r['idle_days']} 天"),
+                    ])
+
+                th_s2 = {"padding":"4px 8px","textAlign":"left","fontSize":"12px",
+                         "color":"#888","borderBottom":"0.5px solid #eee"}
+
+                def sim_table(rows, best_d):
+                    return html.Table([
+                        html.Thead(html.Tr([
+                            html.Th("最小持續",style=th_s2), html.Th("最終資產",style=th_s2),
+                            html.Th("總報酬",style=th_s2), html.Th("交易數",style=th_s2),
+                            html.Th("勝率",style=th_s2), html.Th("最大回撤",style=th_s2),
+                            html.Th("空倉天數",style=th_s2),
+                        ])),
+                        html.Tbody([sim_row_html(d, r, d==best_d) for d,r in rows]),
+                    ], style={"width":"100%","borderCollapse":"collapse","fontSize":"12px"})
+
+                sim_section = html.Div([
+                    html.P("模擬交易（初始 10 萬，按訊號進出場，可過濾短暫訊號）",
+                           style={"fontSize":"12px","color":"#888","margin":"12px 0 4px","paddingLeft":"12px","fontWeight":"500"}),
+                    html.Div([
+                        html.P(f"買入持有基準：{bah_ret:+.2f}%　→　{bah_final/10000:.2f} 萬",
+                               style={"fontSize":"12px","color":"#888","margin":"0 0 8px","paddingLeft":"12px"}),
+                        html.Div([
+                            html.Div([
+                                html.P("只做多（負轉正買入，正轉負空倉）",
+                                       style={"fontSize":"12px","color":"#888","margin":"0 0 4px"}),
+                                html.P(f"最佳：≥{best_sim_long[0]}天，{best_sim_long[1]['final_val']/10000:.2f}萬（{'+' if best_sim_long[1]['total_ret']>=0 else ''}{best_sim_long[1]['total_ret']}%）",
+                                       style={"fontSize":"12px","color":"#0F6E56","margin":"0 0 6px","fontWeight":"500"}),
+                                html.Div(sim_table(sim_rows_long, best_sim_long[0]),
+                                         style={"overflowX":"auto"}),
+                            ], style={"flex":"1","minWidth":"0"}),
+                            html.Div([
+                                html.P("多空都做（負轉正做多，正轉負做空）",
+                                       style={"fontSize":"12px","color":"#888","margin":"0 0 4px"}),
+                                html.P(f"最佳：≥{best_sim_both[0]}天，{best_sim_both[1]['final_val']/10000:.2f}萬（{'+' if best_sim_both[1]['total_ret']>=0 else ''}{best_sim_both[1]['total_ret']}%）",
+                                       style={"fontSize":"12px","color":"#0F6E56","margin":"0 0 6px","fontWeight":"500"}),
+                                html.Div(sim_table(sim_rows_both, best_sim_both[0]),
+                                         style={"overflowX":"auto"}),
+                            ], style={"flex":"1","minWidth":"0"}),
+                        ], style={"display":"flex","gap":"20px","padding":"0 12px","flexWrap":"wrap"}),
+                    ]),
+                ])
+            else:
+                sim_section = html.Div()
+
             backtest_divs.append(html.Div([
                 dcc.Graph(figure=fig_cmp, config={"displayModeBar":False}),
                 summary_cards,
+                sim_section,
                 make_sig_table(best_res["signals"], f"最佳方法：{best_method}"),
             ],style={"marginBottom":"20px","border":"0.5px solid #e5e5e5",
                      "borderRadius":"10px","overflow":"hidden","background":"white","paddingBottom":"12px"}))
