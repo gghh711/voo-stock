@@ -159,6 +159,8 @@ def backtest_direction(closes, dates, window):
             "duration":    duration,
             "price_chg":   price_chg,
             "correct":     correct,
+            "prev_slope":  round(prev, 1),
+            "cur_slope":   round(cur, 1),
         })
         i = j  # 跳到下一段
 
@@ -258,6 +260,7 @@ def backtest_dual_confirmation(closes, dates, price_win, ma_win, ma_period):
             "type": sig_type, "entry_date": entry_date, "exit_date": exit_date,
             "entry_price": entry_price, "exit_price": exit_price,
             "duration": duration, "price_chg": price_chg, "correct": correct,
+            "prev_slope": round(ps_prev, 1), "cur_slope": round(ps_cur, 1),
         })
         i = j
 
@@ -580,6 +583,10 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
                 ok_text   = "✅" if s["correct"] else "❌"
                 ok_color  = "#0F6E56" if s["correct"] else "#A32D2D"
                 type_color = "#0F6E56" if "負轉正" in s["type"] else "#A32D2D"
+                prev_s = s.get("prev_slope", "—")
+                cur_s  = s.get("cur_slope",  "—")
+                prev_str = f"{prev_s:.1f}%" if isinstance(prev_s, float) else str(prev_s)
+                cur_str  = f"{'+' if isinstance(cur_s,float) and cur_s>=0 else ''}{cur_s:.1f}%" if isinstance(cur_s, float) else str(cur_s)
                 rows.append(html.Tr([
                     html.Td(s["type"],        style={"padding":"4px 8px","color":type_color,"fontWeight":"500"}),
                     html.Td(s["entry_date"],  style={"padding":"4px 8px"}),
@@ -589,6 +596,8 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
                     html.Td(f"${s['exit_price']:.2f}",  style={"padding":"4px 8px"}),
                     html.Td(f"{'+' if s['price_chg']>=0 else ''}{s['price_chg']}%",
                             style={"padding":"4px 8px","color":chg_color,"fontWeight":"500"}),
+                    html.Td(prev_str, style={"padding":"4px 8px","color":"#A32D2D"}),
+                    html.Td(cur_str,  style={"padding":"4px 8px","color":"#0F6E56" if isinstance(cur_s,float) and cur_s>=0 else "#A32D2D"}),
                     html.Td(ok_text, style={"padding":"4px 8px","color":ok_color,"fontWeight":"500"}),
                 ]))
             return html.Div([
@@ -599,7 +608,9 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
                         html.Th("類型",style=th_style), html.Th("進場日",style=th_style),
                         html.Th("出場日",style=th_style), html.Th("持續",style=th_style),
                         html.Th("進場價",style=th_style), html.Th("出場價",style=th_style),
-                        html.Th("股價變化",style=th_style), html.Th("預測",style=th_style),
+                        html.Th("股價變化",style=th_style),
+                        html.Th("前日斜率",style=th_style), html.Th("當日斜率",style=th_style),
+                        html.Th("預測",style=th_style),
                     ])),
                     html.Tbody(rows),
                 ],style={"width":"100%","borderCollapse":"collapse","fontSize":"12px"}),
@@ -655,7 +666,8 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
                         ok2  = chg2 > 0 if sig_type2=="負轉正" else chg2 < 0
                         signals2.append({"type":sig_type2,"entry_date":ed2,"exit_date":xd2,
                                          "entry_price":ep2,"exit_price":xp2,
-                                         "duration":dur2,"price_chg":chg2,"correct":ok2})
+                                         "duration":dur2,"price_chg":chg2,"correct":ok2,
+                                         "prev_slope":round(pp,1),"cur_slope":round(ps,1)})
                         j2 = k2
                     def st2(lst2):
                         if not lst2: return {"count":0,"correct_rate":0,"avg_chg":0,"avg_days":0}
