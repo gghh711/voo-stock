@@ -190,6 +190,93 @@ def backtest_all_windows(closes, dates):
         results[win] = backtest_direction(closes, dates, win)
     return results
 
+def sma(closes, w):
+    out = [None] * len(closes)
+    for i in range(w-1, len(closes)):
+        out[i] = sum(closes[i-w+1:i+1]) / w
+    return out
+
+def backtest_dual_confirmation(closes, dates, price_win, ma_win, ma_period):
+    """
+    雙重確認模式：
+    - 收盤價斜率先轉正 AND MA斜率也為正 → 買入訊號（負轉正確認）
+    - 收盤價斜率先轉負 AND MA斜率也為負 → 賣出訊號（正轉負確認）
+    統計到下一次反轉前股價方向是否正確
+    """
+    price_slopes = rolling_annualized_log_slope(closes, price_win)
+    ma_vals      = sma(closes, ma_period)
+    # 對 MA 值算斜率，需要 ma_vals 中非 None 的部分
+    ma_closes_filled = [v if v is not None else 0.0 for v in ma_vals]
+    ma_slopes        = rolling_annualized_log_slope(ma_closes_filled, ma_win)
+    # 把 MA 值為 None 的位置的 ma_slopes 設為 nan
+    for i in range(len(ma_vals)):
+        if ma_vals[i] is None:
+            ma_slopes[i] = float("nan")
+
+    N = len(closes)
+    signals = []
+    i = 1
+    while i < N:
+        ps_prev = price_slopes[i-1]; ps_cur = price_slopes[i]
+        ms_cur  = ma_slopes[i]
+        if math.isnan(ps_prev) or math.isnan(ps_cur) or math.isnan(ms_cur):
+            i += 1; continue
+
+        # 收盤斜率剛轉正 + MA斜率也為正 = 雙重確認買入
+        if ps_prev < 0 and ps_cur > 0 and ms_cur > 0:
+            sig_type = "負轉正（雙確認）"
+        # 收盤斜率剛轉負 + MA斜率也為負 = 雙重確認賣出
+        elif ps_prev > 0 and ps_cur < 0 and ms_cur < 0:
+            sig_type = "正轉負（雙確認）"
+        else:
+            i += 1; continue
+
+        entry_idx   = i
+        entry_price = closes[i]
+        entry_date  = dates[i]
+
+        # 找下一個反轉點
+        j = i + 1
+        while j < N:
+            ps2 = price_slopes[j]; ps2p = price_slopes[j-1]
+            if math.isnan(ps2) or math.isnan(ps2p):
+                j += 1; continue
+            if "負轉正" in sig_type and ps2p > 0 and ps2 < 0:
+                break
+            if "正轉負" in sig_type and ps2p < 0 and ps2 > 0:
+                break
+            j += 1
+
+        exit_idx   = min(j, N-1)
+        exit_price = closes[exit_idx]
+        exit_date  = dates[exit_idx]
+        duration   = exit_idx - entry_idx
+        price_chg  = round((exit_price - entry_price) / entry_price * 100, 2)
+        correct    = price_chg > 0 if "負轉正" in sig_type else price_chg < 0
+
+        signals.append({
+            "type": sig_type, "entry_date": entry_date, "exit_date": exit_date,
+            "entry_price": entry_price, "exit_price": exit_price,
+            "duration": duration, "price_chg": price_chg, "correct": correct,
+        })
+        i = j
+
+    neg2pos = [s for s in signals if "負轉正" in s["type"]]
+    pos2neg = [s for s in signals if "正轉負" in s["type"]]
+
+    def stats(lst):
+        if not lst: return {"count":0,"correct_rate":0,"avg_chg":0,"avg_days":0}
+        correct = sum(1 for s in lst if s["correct"])
+        return {
+            "count":        len(lst),
+            "correct_rate": round(correct / len(lst) * 100),
+            "avg_chg":      round(sum(s["price_chg"] for s in lst) / len(lst), 2),
+            "avg_days":     round(sum(s["duration"]  for s in lst) / len(lst), 1),
+        }
+
+    return {"signals": signals, "neg2pos": stats(neg2pos),
+            "pos2neg": stats(pos2neg), "total": stats(signals)}
+
 def check_slope_alerts(window=5):
     end_dt = datetime.datetime.now(tz=timezone.utc)
     start_dt = end_dt - datetime.timedelta(days=30)
@@ -466,11 +553,58 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
 
     # ── 頁籤二：回測分析 ──
     else:
-        backtest_divs = [
-            html.P("驗證邏輯：斜率由負轉正後，統計到下一次轉負前股價是否上漲；斜率由正轉負後，統計到下一次轉正前股價是否下跌。視窗 2–20 天全部比較。",
-                   style={"fontSize":"13px","color":"#666","marginBottom":"16px",
-                          "background":"#f5f5f3","padding":"10px 14px","borderRadius":"8px"}),
+        # 固定比較組合：收盤5日 vs 10MA5日 vs 20MA5日 vs 雙確認(5日+10MA)
+        COMPARE_CONFIGS = [
+            {"label": "收盤價斜率（5日）",      "mode": "price",  "price_win": 5,  "ma_win": 5, "ma_period": 10},
+            {"label": "10MA斜率（5日）",         "mode": "ma",     "price_win": 5,  "ma_win": 5, "ma_period": 10},
+            {"label": "20MA斜率（5日）",         "mode": "ma",     "price_win": 5,  "ma_win": 5, "ma_period": 20},
+            {"label": "雙確認（收盤+10MA）",     "mode": "dual",   "price_win": 5,  "ma_win": 5, "ma_period": 10},
+            {"label": "雙確認（收盤+20MA）",     "mode": "dual",   "price_win": 5,  "ma_win": 5, "ma_period": 20},
         ]
+
+        backtest_divs = [
+            html.P(
+                "比較五種方法的方向預測正確率：收盤價斜率、10MA斜率、20MA斜率、雙重確認（收盤+10MA同時轉正）、雙重確認（收盤+20MA）。"
+                "訊號出現後統計到下一次反轉前，股價方向是否正確。",
+                style={"fontSize":"13px","color":"#666","marginBottom":"16px",
+                       "background":"#f5f5f3","padding":"10px 14px","borderRadius":"8px"}),
+        ]
+
+        th_style = {"padding":"4px 8px","textAlign":"left","fontSize":"12px",
+                    "color":"#888","borderBottom":"0.5px solid #eee"}
+
+        def make_sig_table(signals, label):
+            rows = []
+            for s in signals:
+                chg_color = "#0F6E56" if s["price_chg"] >= 0 else "#A32D2D"
+                ok_text   = "✅" if s["correct"] else "❌"
+                ok_color  = "#0F6E56" if s["correct"] else "#A32D2D"
+                type_color = "#0F6E56" if "負轉正" in s["type"] else "#A32D2D"
+                rows.append(html.Tr([
+                    html.Td(s["type"],        style={"padding":"4px 8px","color":type_color,"fontWeight":"500"}),
+                    html.Td(s["entry_date"],  style={"padding":"4px 8px"}),
+                    html.Td(s["exit_date"],   style={"padding":"4px 8px"}),
+                    html.Td(f"{s['duration']} 天", style={"padding":"4px 8px"}),
+                    html.Td(f"${s['entry_price']:.2f}", style={"padding":"4px 8px"}),
+                    html.Td(f"${s['exit_price']:.2f}",  style={"padding":"4px 8px"}),
+                    html.Td(f"{'+' if s['price_chg']>=0 else ''}{s['price_chg']}%",
+                            style={"padding":"4px 8px","color":chg_color,"fontWeight":"500"}),
+                    html.Td(ok_text, style={"padding":"4px 8px","color":ok_color,"fontWeight":"500"}),
+                ]))
+            return html.Div([
+                html.P(f"{label} 訊號明細：",
+                       style={"fontSize":"12px","color":"#888","margin":"8px 0 4px","paddingLeft":"12px"}),
+                html.Div(html.Table([
+                    html.Thead(html.Tr([
+                        html.Th("類型",style=th_style), html.Th("進場日",style=th_style),
+                        html.Th("出場日",style=th_style), html.Th("持續",style=th_style),
+                        html.Th("進場價",style=th_style), html.Th("出場價",style=th_style),
+                        html.Th("股價變化",style=th_style), html.Th("預測",style=th_style),
+                    ])),
+                    html.Tbody(rows),
+                ],style={"width":"100%","borderCollapse":"collapse","fontSize":"12px"}),
+                style={"overflowX":"auto","paddingBottom":"8px"}),
+            ]) if rows else html.P("無訊號",style={"fontSize":"12px","color":"#aaa","paddingLeft":"12px"})
 
         for ticker in tickers[:12]:
             d = ticker_data.get(ticker)
@@ -481,99 +615,145 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
                 continue
 
             dates, closes, color = d["dates"], d["closes"], d["color"]
-            all_results = backtest_all_windows(closes, dates)
 
-            # 找最佳視窗（負轉正正確率最高）
-            best_win = max(
-                (w for w in all_results if all_results[w]["neg2pos"]["count"] > 0),
-                key=lambda w: (all_results[w]["neg2pos"]["correct_rate"],
-                               all_results[w]["neg2pos"]["avg_chg"]),
-                default=5
-            )
+            # 跑各方法回測
+            method_results = {}
+            for cfg in COMPARE_CONFIGS:
+                lbl = cfg["label"]
+                if cfg["mode"] == "price":
+                    res = backtest_direction(closes, dates, cfg["price_win"])
+                elif cfg["mode"] == "ma":
+                    ma_vals = sma(closes, cfg["ma_period"])
+                    ma_filled = [v if v is not None else 0.0 for v in ma_vals]
+                    ma_slopes_arr = rolling_annualized_log_slope(ma_filled, cfg["ma_win"])
+                    for idx in range(len(ma_vals)):
+                        if ma_vals[idx] is None:
+                            ma_slopes_arr[idx] = float("nan")
+                    # 用 MA 斜率做方向回測
+                    N2 = len(closes)
+                    signals2 = []
+                    j2 = 1
+                    while j2 < N2:
+                        ps, pp = ma_slopes_arr[j2], ma_slopes_arr[j2-1]
+                        if math.isnan(ps) or math.isnan(pp):
+                            j2 += 1; continue
+                        if pp < 0 and ps > 0:   sig_type2 = "負轉正"
+                        elif pp > 0 and ps < 0: sig_type2 = "正轉負"
+                        else: j2 += 1; continue
+                        ep2, ed2 = closes[j2], dates[j2]
+                        k2 = j2 + 1
+                        while k2 < N2:
+                            ms2, ms2p = ma_slopes_arr[k2], ma_slopes_arr[k2-1]
+                            if math.isnan(ms2) or math.isnan(ms2p): k2 += 1; continue
+                            if sig_type2=="負轉正" and ms2p>0 and ms2<0: break
+                            if sig_type2=="正轉負" and ms2p<0 and ms2>0: break
+                            k2 += 1
+                        ex2 = min(k2, N2-1)
+                        xp2 = closes[ex2]; xd2 = dates[ex2]
+                        dur2 = ex2 - j2
+                        chg2 = round((xp2-ep2)/ep2*100, 2)
+                        ok2  = chg2 > 0 if sig_type2=="負轉正" else chg2 < 0
+                        signals2.append({"type":sig_type2,"entry_date":ed2,"exit_date":xd2,
+                                         "entry_price":ep2,"exit_price":xp2,
+                                         "duration":dur2,"price_chg":chg2,"correct":ok2})
+                        j2 = k2
+                    def st2(lst2):
+                        if not lst2: return {"count":0,"correct_rate":0,"avg_chg":0,"avg_days":0}
+                        c2 = sum(1 for s in lst2 if s["correct"])
+                        return {"count":len(lst2),"correct_rate":round(c2/len(lst2)*100),
+                                "avg_chg":round(sum(s["price_chg"] for s in lst2)/len(lst2),2),
+                                "avg_days":round(sum(s["duration"] for s in lst2)/len(lst2),1)}
+                    n2p2 = [s for s in signals2 if s["type"]=="負轉正"]
+                    p2n2 = [s for s in signals2 if s["type"]=="正轉負"]
+                    res  = {"signals":signals2,"neg2pos":st2(n2p2),"pos2neg":st2(p2n2),"total":st2(signals2)}
+                else:  # dual
+                    res = backtest_dual_confirmation(closes, dates,
+                                                     cfg["price_win"], cfg["ma_win"], cfg["ma_period"])
+                method_results[lbl] = res
 
-            # 長條圖：各視窗正確率
-            win_list   = list(range(2, 21))
-            n2p_rates  = [all_results[w]["neg2pos"]["correct_rate"] for w in win_list]
-            p2n_rates  = [all_results[w]["pos2neg"]["correct_rate"] for w in win_list]
-            n2p_chg    = [all_results[w]["neg2pos"]["avg_chg"] for w in win_list]
-            p2n_chg    = [all_results[w]["pos2neg"]["avg_chg"] for w in win_list]
-            win_labels = [f"{w}日" for w in win_list]
-            bar_colors = [color if w == best_win else "rgba(150,150,150,0.3)" for w in win_list]
+            # 比較長條圖
+            labels_m  = [cfg["label"] for cfg in COMPARE_CONFIGS]
+            n2p_rates = [method_results[l]["neg2pos"]["correct_rate"] for l in labels_m]
+            p2n_rates = [method_results[l]["pos2neg"]["correct_rate"] for l in labels_m]
+            n2p_cnts  = [method_results[l]["neg2pos"]["count"] for l in labels_m]
+            n2p_chgs  = [method_results[l]["neg2pos"]["avg_chg"] for l in labels_m]
 
-            fig_bt = go.Figure()
-            fig_bt.add_trace(go.Bar(x=win_labels, y=n2p_rates, name="負轉正正確率",
-                marker_color=bar_colors,
-                hovertemplate="視窗%{x}<br>負轉正正確率: %{y}%<extra></extra>"))
-            fig_bt.add_trace(go.Scatter(x=win_labels, y=p2n_rates, name="正轉負正確率",
-                line=dict(color="rgba(226,75,74,0.7)", width=2, dash="dot"), mode="lines+markers",
-                marker=dict(size=4),
-                hovertemplate="視窗%{x}<br>正轉負正確率: %{y}%<extra></extra>"))
-            fig_bt.add_hline(y=50, line_color="#ccc", line_dash="dash", line_width=1,
-                             annotation_text="50%隨機線", annotation_position="right")
+            bar_clrs = ["rgba(150,150,150,0.35)","rgba(29,158,117,0.5)",
+                        "rgba(127,119,221,0.5)","rgba(37,99,235,0.7)","rgba(37,99,235,0.4)"]
 
-            best_n2p = all_results[best_win]["neg2pos"]
-            fig_bt.update_layout(
-                title=dict(
-                    text=(f"<b>{ticker}</b>　方向預測正確率｜"
-                          f"最佳視窗：{best_win}天（負轉正正確率 {best_n2p['correct_rate']}%，"
-                          f"平均漲幅 {'+' if best_n2p['avg_chg']>=0 else ''}{best_n2p['avg_chg']}%，"
-                          f"平均持續 {best_n2p['avg_days']} 天）"),
-                    font=dict(size=12, color="#1a1a1a"), x=0),
-                barmode="overlay", hovermode="x unified",
+            fig_cmp = go.Figure()
+            fig_cmp.add_trace(go.Bar(
+                x=labels_m, y=n2p_rates, name="負轉正正確率",
+                marker_color=bar_clrs,
+                text=[f"{r}%<br>({c}次)" for r,c in zip(n2p_rates,n2p_cnts)],
+                textposition="outside",
+                hovertemplate="%{x}<br>負轉正正確率: %{y}%<extra></extra>"))
+            fig_cmp.add_trace(go.Scatter(
+                x=labels_m, y=p2n_rates, name="正轉負正確率",
+                line=dict(color="rgba(226,75,74,0.7)",width=2,dash="dot"),
+                mode="lines+markers", marker=dict(size=5),
+                hovertemplate="%{x}<br>正轉負正確率: %{y}%<extra></extra>"))
+            fig_cmp.add_trace(go.Scatter(
+                x=labels_m, y=n2p_chgs, name="負轉正平均漲幅",
+                line=dict(color="rgba(37,99,235,0.6)",width=1.5),
+                mode="lines+markers", marker=dict(size=4), yaxis="y2",
+                hovertemplate="%{x}<br>平均漲幅: %{y:.1f}%<extra></extra>"))
+            fig_cmp.add_hline(y=50, line_color="#ccc", line_dash="dash", line_width=1,
+                              annotation_text="隨機基準 50%", annotation_position="right")
+
+            fig_cmp.update_layout(
+                title=dict(text=f"<b>{ticker}</b>　五種方法方向預測正確率比較",
+                           font=dict(size=13,color="#1a1a1a"),x=0),
+                barmode="group", hovermode="x unified",
                 legend=dict(orientation="h",yanchor="bottom",y=1.06,xanchor="right",x=1,font=dict(size=11)),
                 plot_bgcolor="white", paper_bgcolor="white",
-                margin=dict(l=55,r=20,t=60,b=40),
-                font=dict(family="sans-serif",size=12), height=300,
-                yaxis=dict(title="正確率(%)",showgrid=True,gridcolor="#eee",range=[0,105]),
-                xaxis=dict(showgrid=True,gridcolor="#eee"),
+                margin=dict(l=55,r=65,t=60,b=80),
+                font=dict(family="sans-serif",size=12), height=320,
+                yaxis=dict(title="正確率(%)",showgrid=True,gridcolor="#eee",range=[0,115]),
+                yaxis2=dict(title="平均漲幅(%)",overlaying="y",side="right",showgrid=False),
+                xaxis=dict(showgrid=False,tickangle=-15),
             )
 
-            # 最佳視窗的訊號明細
-            best_signals = all_results[best_win]["signals"]
-            sig_rows = []
-            for s in best_signals:
-                chg_color = "#0F6E56" if s["price_chg"] >= 0 else "#A32D2D"
-                ok_text   = "✅ 正確" if s["correct"] else "❌ 錯誤"
-                ok_color  = "#0F6E56" if s["correct"] else "#A32D2D"
-                sig_rows.append(html.Tr([
-                    html.Td(s["type"],
-                            style={"padding":"4px 8px",
-                                   "color":"#0F6E56" if s["type"]=="負轉正" else "#A32D2D",
-                                   "fontWeight":"500"}),
-                    html.Td(s["entry_date"],style={"padding":"4px 8px"}),
-                    html.Td(s["exit_date"], style={"padding":"4px 8px"}),
-                    html.Td(f"{s['duration']} 天",style={"padding":"4px 8px"}),
-                    html.Td(f"${s['entry_price']:.2f}",style={"padding":"4px 8px"}),
-                    html.Td(f"${s['exit_price']:.2f}", style={"padding":"4px 8px"}),
-                    html.Td(f"{'+' if s['price_chg']>=0 else ''}{s['price_chg']}%",
-                            style={"padding":"4px 8px","color":chg_color,"fontWeight":"500"}),
-                    html.Td(ok_text, style={"padding":"4px 8px","color":ok_color,"fontWeight":"500"}),
-                ]))
+            # 找整體最佳方法
+            best_method = max(labels_m,
+                key=lambda l: (method_results[l]["neg2pos"]["correct_rate"],
+                               method_results[l]["neg2pos"]["avg_chg"]))
+            best_res = method_results[best_method]
 
-            th_style = {"padding":"4px 8px","textAlign":"left","fontSize":"12px",
-                        "color":"#888","borderBottom":"0.5px solid #eee"}
-            detail_table = html.Div([
-                html.P(f"最佳視窗（{best_win}天）訊號明細：",
-                       style={"fontSize":"12px","color":"#888","margin":"8px 0 4px","paddingLeft":"12px"}),
-                html.Div(html.Table([
-                    html.Thead(html.Tr([
-                        html.Th("訊號類型",style=th_style),
-                        html.Th("進場日",style=th_style),
-                        html.Th("出場日",style=th_style),
-                        html.Th("持續天數",style=th_style),
-                        html.Th("進場價",style=th_style),
-                        html.Th("出場價",style=th_style),
-                        html.Th("股價變化",style=th_style),
-                        html.Th("預測",style=th_style),
-                    ])),
-                    html.Tbody(sig_rows),
-                ],style={"width":"100%","borderCollapse":"collapse","fontSize":"12px"}),
-                style={"overflowX":"auto","paddingBottom":"8px"}),
+            summary_cards = html.Div([
+                html.Div([
+                    html.Div([
+                        html.Div("最佳方法",style={"fontSize":"11px","color":"#888","marginBottom":"3px"}),
+                        html.Div(best_method,style={"fontSize":"15px","fontWeight":"500","color":"#0F6E56"}),
+                    ],style={"background":"#f0faf5","borderRadius":"8px","padding":"10px 14px",
+                             "border":"1.5px solid #1D9E75"}),
+                    html.Div([
+                        html.Div("負轉正正確率",style={"fontSize":"11px","color":"#888","marginBottom":"3px"}),
+                        html.Div(f"{best_res['neg2pos']['correct_rate']}%",
+                                 style={"fontSize":"20px","fontWeight":"500","color":"#0F6E56"}),
+                        html.Div(f"{best_res['neg2pos']['count']} 次訊號",style={"fontSize":"11px","color":"#888"}),
+                    ],style={"background":"#f5f5f3","borderRadius":"8px","padding":"10px 14px"}),
+                    html.Div([
+                        html.Div("平均漲幅（持有到下次反轉）",style={"fontSize":"11px","color":"#888","marginBottom":"3px"}),
+                        html.Div(f"{'+' if best_res['neg2pos']['avg_chg']>=0 else ''}{best_res['neg2pos']['avg_chg']}%",
+                                 style={"fontSize":"20px","fontWeight":"500",
+                                        "color":"#0F6E56" if best_res['neg2pos']['avg_chg']>=0 else "#A32D2D"}),
+                        html.Div(f"平均持續 {best_res['neg2pos']['avg_days']} 天",style={"fontSize":"11px","color":"#888"}),
+                    ],style={"background":"#f5f5f3","borderRadius":"8px","padding":"10px 14px"}),
+                    html.Div([
+                        html.Div("正轉負正確率",style={"fontSize":"11px","color":"#888","marginBottom":"3px"}),
+                        html.Div(f"{best_res['pos2neg']['correct_rate']}%",
+                                 style={"fontSize":"20px","fontWeight":"500","color":"#A32D2D"}),
+                        html.Div(f"{best_res['pos2neg']['count']} 次訊號",style={"fontSize":"11px","color":"#888"}),
+                    ],style={"background":"#f5f5f3","borderRadius":"8px","padding":"10px 14px"}),
+                ],style={"display":"grid","gridTemplateColumns":"repeat(4,1fr)","gap":"10px",
+                         "padding":"12px","marginTop":"4px"}),
             ])
 
             backtest_divs.append(html.Div([
-                dcc.Graph(figure=fig_bt, config={"displayModeBar":False}),
-                detail_table,
+                dcc.Graph(figure=fig_cmp, config={"displayModeBar":False}),
+                summary_cards,
+                make_sig_table(best_res["signals"], f"最佳方法：{best_method}"),
             ],style={"marginBottom":"20px","border":"0.5px solid #e5e5e5",
                      "borderRadius":"10px","overflow":"hidden","background":"white","paddingBottom":"12px"}))
 
