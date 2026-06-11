@@ -1,6 +1,5 @@
 """
 股票滾動年化斜率 + 恐懼指標 + LINE 通知
-每天台灣時間 22:00 自動檢查斜率是否由負轉正，是則發 LINE 訊息
 """
 
 import datetime, math, os, threading
@@ -10,21 +9,26 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import dash
 from dash import dcc, html, Input, Output, State
+from flask import request as flask_request
 
 LINE_TOKEN   = os.environ.get("LINE_TOKEN", "BL02SzdP0SeOiz4iRC+fqU8X9hp+zmcejR4i9WGYNg9TFCM/i97k1M8vm8Hki5fM2CWuFEKQlF4vlMnNkVDV+YKVNxtSJxXIl0AYZ8xUVmLmJ6Cyd6qw8iCBY6VekjwyFbrF/ocFfRUymRkkiw9UMQdB04t89/1O/w1cDnyilFU=")
-LINE_USER_ID = os.environ.get("LINE_USER_ID", "Uf3bb45e023bcc4083caee107fb5f1932")
+LINE_USER_ID = os.environ.get("LINE_USER_ID", "")  # 取得後填入
 WATCH_TICKERS = ["QQQ", "VOO", "TSM"]
 
 COLORS = ["#2563eb","#16a34a","#dc2626","#d97706","#7c3aed","#0891b2","#db2777","#65a30d","#b45309","#0f766e"]
 HEADERS = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Accept":"application/json","Referer":"https://finance.yahoo.com"}
 
-def send_line(message):
+def send_line_to(to, message):
     try:
         requests.post("https://api.line.me/v2/bot/message/push",
             headers={"Authorization":f"Bearer {LINE_TOKEN}","Content-Type":"application/json"},
-            json={"to":LINE_USER_ID,"messages":[{"type":"text","text":message}]},timeout=10)
+            json={"to":to,"messages":[{"type":"text","text":message}]},timeout=10)
     except Exception as e:
         print(f"LINE 發送失敗：{e}")
+
+def send_line(message):
+    if LINE_USER_ID:
+        send_line_to(LINE_USER_ID, message)
 
 def fetch_yahoo_range(ticker, start_dt, end_dt):
     start = int(start_dt.timestamp())
@@ -38,8 +42,7 @@ def fetch_yahoo_range(ticker, start_dt, end_dt):
     if chart.get("error"):
         raise RuntimeError(chart["error"].get("description","未知錯誤"))
     result = chart.get("result")
-    if not result:
-        raise RuntimeError("找不到資料")
+    if not result: raise RuntimeError("找不到資料")
     result = result[0]
     timestamps = result["timestamp"]
     quote = result["indicators"]["quote"][0]
@@ -107,7 +110,6 @@ def check_slope_alerts(window=5):
             print(f"檢查 {ticker} 失敗：{e}")
     if alerts:
         send_line("【股票斜率提醒】\n\n" + "\n\n".join(alerts))
-        print(f"已發送 LINE 通知：{len(alerts)} 支股票")
     else:
         print(f"[{datetime.datetime.now()}] 無斜率轉正信號")
 
@@ -185,6 +187,8 @@ def update_slider_label(days):
 
 @app.callback(Output("test-msg","children"),Input("test-btn","n_clicks"),prevent_initial_call=True)
 def test_line(n):
+    if not LINE_USER_ID:
+        return "❌ 尚未設定 User ID，請先傳訊息給 Bot 取得 User ID"
     send_line("【測試】股票斜率提醒系統運作正常 ✅\n每天 22:00 會自動檢查 QQQ、VOO、TSM 斜率。")
     return "✅ 測試訊息已發送，請查看 LINE"
 
@@ -328,6 +332,18 @@ def update_charts(n_clicks, ticker_str, window, show_volume, days):
                    "borderRadius":"10px","overflow":"hidden","background":"white"}))
 
     return chart_divs, fear_divs, "　".join(messages), "　".join(fear_notes)
+
+
+# ── Webhook：收到訊息後回覆 User ID ──────────────────────────
+@server.route("/webhook", methods=["POST"])
+def webhook():
+    body = flask_request.get_json(silent=True) or {}
+    for event in body.get("events", []):
+        if event.get("type") == "message":
+            user_id = event["source"]["userId"]
+            send_line_to(user_id, f"你的 User ID 是：\n{user_id}\n\n請把這串 ID 填入程式的 LINE_USER_ID。")
+    return "OK", 200
+
 
 if __name__ == "__main__":
     t = threading.Thread(target=scheduler_loop, daemon=True)
