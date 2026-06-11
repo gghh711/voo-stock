@@ -7,12 +7,12 @@ from datetime import timezone
 import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import flask
 import dash
 from dash import dcc, html, Input, Output, State
-from flask import request as flask_request
 
 LINE_TOKEN   = os.environ.get("LINE_TOKEN", "BL02SzdP0SeOiz4iRC+fqU8X9hp+zmcejR4i9WGYNg9TFCM/i97k1M8vm8Hki5fM2CWuFEKQlF4vlMnNkVDV+YKVNxtSJxXIl0AYZ8xUVmLmJ6Cyd6qw8iCBY6VekjwyFbrF/ocFfRUymRkkiw9UMQdB04t89/1O/w1cDnyilFU=")
-LINE_USER_ID = os.environ.get("LINE_USER_ID", "")  # 取得後填入
+LINE_USER_ID = os.environ.get("LINE_USER_ID", "U2af0aa14205601e29e61d548c2f10f5a")
 WATCH_TICKERS = ["QQQ", "VOO", "TSM"]
 
 COLORS = ["#2563eb","#16a34a","#dc2626","#d97706","#7c3aed","#0891b2","#db2777","#65a30d","#b45309","#0f766e"]
@@ -124,8 +124,19 @@ def scheduler_loop():
         threading.Event().wait(wait_sec)
         check_slope_alerts()
 
-app = dash.Dash(__name__)
-server = app.server
+# ── 先建立 Flask server，再註冊 webhook，最後建立 Dash ──────
+server = flask.Flask(__name__)
+
+@server.route("/webhook", methods=["POST"])
+def webhook():
+    body = flask.request.get_json(silent=True) or {}
+    for event in body.get("events", []):
+        if event.get("type") == "message":
+            user_id = event["source"]["userId"]
+            send_line_to(user_id, f"你的 User ID 是：\n{user_id}\n\n請把這串 ID 填入程式的 LINE_USER_ID。")
+    return "OK", 200
+
+app = dash.Dash(__name__, server=server)
 app.title = "股票滾動年化斜率"
 
 app.layout = html.Div([
@@ -299,7 +310,6 @@ def update_charts(n_clicks, ticker_str, window, show_volume, days):
             fear_notes.append("✅ VIX")
         else:
             fear_notes.append("❌ VIX 無資料")
-
         if has_fng:
             fg = sorted(fng_data.keys())
             fv = [fng_data[d] for d in fg]
@@ -332,17 +342,6 @@ def update_charts(n_clicks, ticker_str, window, show_volume, days):
                    "borderRadius":"10px","overflow":"hidden","background":"white"}))
 
     return chart_divs, fear_divs, "　".join(messages), "　".join(fear_notes)
-
-
-# ── Webhook：收到訊息後回覆 User ID ──────────────────────────
-@server.route("/webhook", methods=["POST"])
-def webhook():
-    body = flask_request.get_json(silent=True) or {}
-    for event in body.get("events", []):
-        if event.get("type") == "message":
-            user_id = event["source"]["userId"]
-            send_line_to(user_id, f"你的 User ID 是：\n{user_id}\n\n請把這串 ID 填入程式的 LINE_USER_ID。")
-    return "OK", 200
 
 
 if __name__ == "__main__":
