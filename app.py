@@ -170,10 +170,15 @@ app.layout = html.Div([
         html.Button("立即測試 LINE 通知",id="test-btn",n_clicks=0,
                     style={"alignSelf":"flex-end","padding":"8px 16px","background":"#06c755",
                            "color":"#fff","border":"none","borderRadius":"6px","cursor":"pointer","fontSize":"13px"}),
+        html.Button("發送目前斜率",id="slope-btn",n_clicks=0,
+                    style={"alignSelf":"flex-end","padding":"8px 16px","background":"#2563eb",
+                           "color":"#fff","border":"none","borderRadius":"6px","cursor":"pointer","fontSize":"13px"}),
     ],style={"display":"flex","flexWrap":"wrap","gap":"16px","alignItems":"flex-end",
              "background":"#f5f5f3","borderRadius":"10px","padding":"14px 16px","marginBottom":"12px"}),
     html.Div(id="test-msg",style={"fontSize":"13px","color":"#06c755","minHeight":"20px",
-                                   "marginBottom":"4px","fontFamily":"sans-serif"}),
+                                   "marginBottom":"2px","fontFamily":"sans-serif"}),
+    html.Div(id="slope-msg",style={"fontSize":"13px","color":"#2563eb","minHeight":"20px",
+                                    "marginBottom":"4px","fontFamily":"sans-serif"}),
     html.Div([
         html.Label(id="slider-label",style={"fontSize":"12px","color":"#888","marginBottom":"6px","display":"block"}),
         dcc.Slider(id="days-slider",min=30,max=548,step=30,value=365,
@@ -202,6 +207,32 @@ def test_line(n):
         return "❌ 尚未設定 User ID，請先傳訊息給 Bot 取得 User ID"
     send_line("【測試】股票斜率提醒系統運作正常 ✅\n每天 22:00 會自動檢查 QQQ、VOO、TSM 斜率。")
     return "✅ 測試訊息已發送，請查看 LINE"
+
+@app.callback(Output("slope-msg","children"),Input("slope-btn","n_clicks"),prevent_initial_call=True)
+def send_current_slope(n):
+    if not LINE_USER_ID:
+        return "❌ 尚未設定 User ID"
+    end_dt   = datetime.datetime.now(tz=timezone.utc)
+    start_dt = end_dt - datetime.timedelta(days=30)
+    window   = 5
+    lines = ["【目前斜率報告】"]
+    tw_time = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+    lines.append(f"時間：{tw_time} 台灣時間\n")
+    for ticker in WATCH_TICKERS:
+        try:
+            _, closes, _ = fetch_yahoo_range(ticker, start_dt, end_dt)
+            slopes = rolling_annualized_log_slope(closes, window)
+            valid = [s for s in slopes if not math.isnan(s)]
+            if not valid:
+                lines.append(f"{ticker}：無法計算")
+                continue
+            last_slope = valid[-1]
+            arrow = "📈" if last_slope > 0 else "📉"
+            lines.append(f"{arrow} {ticker}\n  斜率：{last_slope:.1f}%\n  現價：${closes[-1]:.2f}")
+        except Exception as e:
+            lines.append(f"{ticker}：錯誤 {e}")
+    send_line("\n\n".join(lines))
+    return "✅ 斜率已發送到 LINE"
 
 @app.callback(
     Output("charts-container","children"), Output("fear-charts","children"),
