@@ -93,32 +93,101 @@ def rolling_annualized_log_slope(closes, window):
         out[i] = (math.exp(b*252)-1)*100
     return out
 
-def backtest_windows(closes, dates, hold_days):
-    """對 2~20 日視窗跑回測，回傳各視窗統計"""
+def backtest_direction(closes, dates, window):
+    """
+    驗證斜率方向是否預測正確：
+    - 斜率由負轉正 → 統計到下一次轉負前，股價是否確實上漲
+    - 斜率由正轉負 → 統計到下一次轉正前，股價是否確實下跌
+    回傳每個轉折訊號的統計
+    """
+    slopes = rolling_annualized_log_slope(closes, window)
     N = len(closes)
-    results = []
+    signals = []
+
+    i = 1
+    while i < N:
+        prev, cur = slopes[i-1], slopes[i]
+        if math.isnan(prev) or math.isnan(cur):
+            i += 1
+            continue
+
+        # 找轉折點
+        if prev < 0 and cur > 0:
+            sig_type = "負轉正"  # 預測：之後股價應上漲
+        elif prev > 0 and cur < 0:
+            sig_type = "正轉負"  # 預測：之後股價應下跌
+        else:
+            i += 1
+            continue
+
+        entry_idx = i
+        entry_price = closes[i]
+        entry_date = dates[i]
+
+        # 找下一個反轉點（或到資料末尾）
+        j = i + 1
+        while j < N:
+            s_cur  = slopes[j]
+            s_prev = slopes[j-1]
+            if math.isnan(s_cur) or math.isnan(s_prev):
+                j += 1
+                continue
+            if sig_type == "負轉正" and s_prev > 0 and s_cur < 0:
+                break  # 找到下一個轉負
+            if sig_type == "正轉負" and s_prev < 0 and s_cur > 0:
+                break  # 找到下一個轉正
+            j += 1
+
+        exit_idx   = min(j, N - 1)
+        exit_price = closes[exit_idx]
+        exit_date  = dates[exit_idx]
+        duration   = exit_idx - entry_idx
+        price_chg  = round((exit_price - entry_price) / entry_price * 100, 2)
+
+        # 判斷預測是否正確
+        if sig_type == "負轉正":
+            correct = price_chg > 0
+        else:
+            correct = price_chg < 0
+
+        signals.append({
+            "type":        sig_type,
+            "entry_date":  entry_date,
+            "exit_date":   exit_date,
+            "entry_price": entry_price,
+            "exit_price":  exit_price,
+            "duration":    duration,
+            "price_chg":   price_chg,
+            "correct":     correct,
+        })
+        i = j  # 跳到下一段
+
+    # 彙總統計
+    neg2pos = [s for s in signals if s["type"] == "負轉正"]
+    pos2neg = [s for s in signals if s["type"] == "正轉負"]
+
+    def stats(lst):
+        if not lst: return {"count":0,"correct_rate":0,"avg_chg":0,"avg_days":0}
+        correct = sum(1 for s in lst if s["correct"])
+        return {
+            "count":        len(lst),
+            "correct_rate": round(correct / len(lst) * 100),
+            "avg_chg":      round(sum(s["price_chg"] for s in lst) / len(lst), 2),
+            "avg_days":     round(sum(s["duration"]  for s in lst) / len(lst), 1),
+        }
+
+    return {
+        "signals":  signals,
+        "neg2pos":  stats(neg2pos),
+        "pos2neg":  stats(pos2neg),
+        "total":    stats(signals),
+    }
+
+def backtest_all_windows(closes, dates):
+    """對 2~20 日視窗都跑方向回測"""
+    results = {}
     for win in range(2, 21):
-        slopes = rolling_annualized_log_slope(closes, win)
-        signals = []
-        for i in range(1, N):
-            prev, cur = slopes[i-1], slopes[i]
-            if math.isnan(prev) or math.isnan(cur): continue
-            if prev < 0 and cur > 0:
-                bp = closes[i]
-                si = min(i + hold_days, N - 1)
-                sp = closes[si]
-                ret = round((sp - bp) / bp * 100, 2)
-                # 前15日最低點距離
-                lo = min(closes[max(0, i-15):i+1])
-                missed = round((bp - lo) / lo * 100, 2)
-                signals.append({"date": dates[i], "bp": bp, "sp": sp,
-                                 "ret": ret, "missed": missed, "slope": round(cur, 1)})
-        cnt = len(signals)
-        win_cnt = sum(1 for s in signals if s["ret"] > 0)
-        wr = round(win_cnt / cnt * 100) if cnt > 0 else 0
-        ar = round(sum(s["ret"] for s in signals) / cnt, 2) if cnt > 0 else 0
-        am = round(sum(s["missed"] for s in signals) / cnt, 2) if cnt > 0 else 0
-        results.append({"win": win, "count": cnt, "wr": wr, "ar": ar, "am": am, "signals": signals})
+        results[win] = backtest_direction(closes, dates, win)
     return results
 
 def check_slope_alerts(window=5):
@@ -180,7 +249,6 @@ app.layout = html.Div([
     html.P("資料從今天往回抓，可用滑桿調整區間（最長 1.5 年）｜每天 22:00 自動檢查斜率轉正並發 LINE 通知",
            style={"fontFamily":"sans-serif","color":"#888","marginBottom":"16px"}),
 
-    # 控制列
     html.Div([
         html.Div([
             html.Label("股票代號（逗號分隔）",style={"fontSize":"12px","color":"#888"}),
@@ -225,12 +293,9 @@ app.layout = html.Div([
 
     html.Div(id="status-msg",style={"fontSize":"13px","color":"#888","minHeight":"20px","marginBottom":"8px","fontFamily":"sans-serif"}),
 
-    # 頁籤
     dcc.Tabs(id="tabs", value="tab-chart", children=[
-        dcc.Tab(label="📈 股價圖表", value="tab-chart",
-                style=TAB_STYLE, selected_style=TAB_SEL),
-        dcc.Tab(label="🔬 回測分析", value="tab-backtest",
-                style=TAB_STYLE, selected_style=TAB_SEL),
+        dcc.Tab(label="📈 股價圖表", value="tab-chart", style=TAB_STYLE, selected_style=TAB_SEL),
+        dcc.Tab(label="🔬 回測分析", value="tab-backtest", style=TAB_STYLE, selected_style=TAB_SEL),
     ], style={"marginBottom":"0"}),
 
     html.Div(id="tab-content"),
@@ -326,14 +391,12 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
     start_dt = end_dt - datetime.timedelta(days=days)
     date_range_str = f"{start_dt.strftime('%Y-%m-%d')} ～ {end_dt.strftime('%Y-%m-%d')}"
 
-    # 抓資料（兩個頁籤共用）
     ticker_data = {}
     messages = []
     for i, ticker in enumerate(tickers[:12]):
         try:
             dates, closes, volumes = fetch_yahoo_range(ticker, start_dt, end_dt)
-            ticker_data[ticker] = {"dates": dates, "closes": closes, "volumes": volumes,
-                                   "color": COLORS[i % len(COLORS)]}
+            ticker_data[ticker] = {"dates":dates,"closes":closes,"volumes":volumes,"color":COLORS[i%len(COLORS)]}
             messages.append(f"✅ {ticker} {len(dates)}日")
         except Exception as e:
             messages.append(f"❌ {ticker}: {e}")
@@ -359,7 +422,6 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
                 if k == 0: vol_colors.append("rgba(150,150,150,0.5)")
                 elif closes[k] >= closes[k-1]: vol_colors.append("rgba(34,160,107,0.5)")
                 else: vol_colors.append("rgba(226,72,61,0.5)")
-
             if show_vol:
                 fig = make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.68,0.32],
                                     vertical_spacing=0.04,specs=[[{"secondary_y":True}],[{"secondary_y":False}]])
@@ -367,7 +429,6 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
             else:
                 fig = make_subplots(rows=1,cols=1,specs=[[{"secondary_y":True}]])
                 chart_height = 300
-
             fig.add_trace(go.Bar(x=dates,y=pos_s,name="上升",marker_color="rgba(34,160,107,0.35)",showlegend=False,
                 hovertemplate="%{x}<br>斜率: %{y:.1f}%<extra></extra>"),row=1,col=1,secondary_y=False)
             fig.add_trace(go.Bar(x=dates,y=neg_s,name="下跌",marker_color="rgba(226,72,61,0.35)",showlegend=False,
@@ -405,106 +466,116 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
 
     # ── 頁籤二：回測分析 ──
     else:
-        hold_days = 10  # 預設持有天數
         backtest_divs = [
-            html.Div([
-                html.Label("持有天數（買入後幾天計算報酬）",
-                           style={"fontSize":"12px","color":"#888","marginRight":"10px"}),
-                dcc.Input(id="bt-hold",value=10,type="number",min=3,max=30,
-                          style={"width":"60px","padding":"5px 8px","borderRadius":"6px",
-                                 "border":"1px solid #ddd","fontSize":"13px"}),
-                html.Span("天",style={"fontSize":"13px","color":"#888","marginLeft":"6px"}),
-            ],style={"display":"flex","alignItems":"center","marginBottom":"16px",
-                     "background":"#f5f5f3","padding":"12px 16px","borderRadius":"10px"}),
+            html.P("驗證邏輯：斜率由負轉正後，統計到下一次轉負前股價是否上漲；斜率由正轉負後，統計到下一次轉正前股價是否下跌。視窗 2–20 天全部比較。",
+                   style={"fontSize":"13px","color":"#666","marginBottom":"16px",
+                          "background":"#f5f5f3","padding":"10px 14px","borderRadius":"8px"}),
         ]
 
         for ticker in tickers[:12]:
             d = ticker_data.get(ticker)
             if d is None:
-                backtest_divs.append(html.Div(f"❌ {ticker}：資料不足，無法回測",
+                backtest_divs.append(html.Div(f"❌ {ticker}：資料不足",
                     style={"padding":"10px","color":"#dc2626","fontSize":"13px",
                            "background":"#fff5f5","borderRadius":"8px","marginBottom":"12px"}))
                 continue
 
-            dates, closes = d["dates"], d["closes"]
-            color = d["color"]
-            results = backtest_windows(closes, dates, hold_days)
-            valid = [r for r in results if r["count"] > 0]
+            dates, closes, color = d["dates"], d["closes"], d["color"]
+            all_results = backtest_all_windows(closes, dates)
 
-            if not valid:
-                backtest_divs.append(html.Div(f"⚪ {ticker}：資料期間內無訊號",
-                    style={"padding":"10px","color":"#888","fontSize":"13px","marginBottom":"12px"}))
-                continue
+            # 找最佳視窗（負轉正正確率最高）
+            best_win = max(
+                (w for w in all_results if all_results[w]["neg2pos"]["count"] > 0),
+                key=lambda w: (all_results[w]["neg2pos"]["correct_rate"],
+                               all_results[w]["neg2pos"]["avg_chg"]),
+                default=5
+            )
 
-            best = max(valid, key=lambda r: (r["wr"], r["ar"]))
-
-            # 長條圖：各視窗勝率
-            wins_list  = [r["wr"] for r in results]
-            rets_list  = [r["ar"] for r in results]
-            miss_list  = [r["am"] for r in results]
-            win_labels = [f"{r['win']}日" for r in results]
-            bar_colors = [color if r["win"] == best["win"] else "rgba(150,150,150,0.3)" for r in results]
+            # 長條圖：各視窗正確率
+            win_list   = list(range(2, 21))
+            n2p_rates  = [all_results[w]["neg2pos"]["correct_rate"] for w in win_list]
+            p2n_rates  = [all_results[w]["pos2neg"]["correct_rate"] for w in win_list]
+            n2p_chg    = [all_results[w]["neg2pos"]["avg_chg"] for w in win_list]
+            p2n_chg    = [all_results[w]["pos2neg"]["avg_chg"] for w in win_list]
+            win_labels = [f"{w}日" for w in win_list]
+            bar_colors = [color if w == best_win else "rgba(150,150,150,0.3)" for w in win_list]
 
             fig_bt = go.Figure()
-            fig_bt.add_trace(go.Bar(x=win_labels, y=wins_list, name="勝率(%)",
-                marker_color=bar_colors, yaxis="y1",
-                hovertemplate="視窗: %{x}<br>勝率: %{y}%<extra></extra>"))
-            fig_bt.add_trace(go.Scatter(x=win_labels, y=rets_list, name="平均報酬(%)",
-                line=dict(color="#378ADD",width=2), mode="lines+markers",
-                marker=dict(size=4), yaxis="y2",
-                hovertemplate="視窗: %{x}<br>平均報酬: %{y:.1f}%<extra></extra>"))
-            fig_bt.add_trace(go.Scatter(x=win_labels, y=miss_list, name="錯過底部(%)",
-                line=dict(color="rgba(226,75,74,0.6)",width=1.5,dash="dot"), mode="lines",
-                yaxis="y2",
-                hovertemplate="視窗: %{x}<br>錯過底部: %{y:.1f}%<extra></extra>"))
+            fig_bt.add_trace(go.Bar(x=win_labels, y=n2p_rates, name="負轉正正確率",
+                marker_color=bar_colors,
+                hovertemplate="視窗%{x}<br>負轉正正確率: %{y}%<extra></extra>"))
+            fig_bt.add_trace(go.Scatter(x=win_labels, y=p2n_rates, name="正轉負正確率",
+                line=dict(color="rgba(226,75,74,0.7)", width=2, dash="dot"), mode="lines+markers",
+                marker=dict(size=4),
+                hovertemplate="視窗%{x}<br>正轉負正確率: %{y}%<extra></extra>"))
+            fig_bt.add_hline(y=50, line_color="#ccc", line_dash="dash", line_width=1,
+                             annotation_text="50%隨機線", annotation_position="right")
+
+            best_n2p = all_results[best_win]["neg2pos"]
             fig_bt.update_layout(
-                title=dict(text=f"<b>{ticker}</b>　回測｜最佳視窗：{best['win']}天（勝率 {best['wr']}%，持有{hold_days}天平均 {'+' if best['ar']>=0 else ''}{best['ar']}%）",
-                           font=dict(size=13,color="#1a1a1a"),x=0),
+                title=dict(
+                    text=(f"<b>{ticker}</b>　方向預測正確率｜"
+                          f"最佳視窗：{best_win}天（負轉正正確率 {best_n2p['correct_rate']}%，"
+                          f"平均漲幅 {'+' if best_n2p['avg_chg']>=0 else ''}{best_n2p['avg_chg']}%，"
+                          f"平均持續 {best_n2p['avg_days']} 天）"),
+                    font=dict(size=12, color="#1a1a1a"), x=0),
                 barmode="overlay", hovermode="x unified",
                 legend=dict(orientation="h",yanchor="bottom",y=1.06,xanchor="right",x=1,font=dict(size=11)),
                 plot_bgcolor="white", paper_bgcolor="white",
-                margin=dict(l=55,r=60,t=50,b=40),
-                font=dict(family="sans-serif",size=12), height=280,
-                yaxis=dict(title="勝率(%)",showgrid=True,gridcolor="#eee",range=[0,105]),
-                yaxis2=dict(title="報酬/錯過(%)",overlaying="y",side="right",showgrid=False),
+                margin=dict(l=55,r=20,t=60,b=40),
+                font=dict(family="sans-serif",size=12), height=300,
+                yaxis=dict(title="正確率(%)",showgrid=True,gridcolor="#eee",range=[0,105]),
                 xaxis=dict(showgrid=True,gridcolor="#eee"),
             )
 
-            # 最佳視窗訊號明細表
+            # 最佳視窗的訊號明細
+            best_signals = all_results[best_win]["signals"]
             sig_rows = []
-            for s in best["signals"]:
-                ret_color = "#0F6E56" if s["ret"] >= 0 else "#A32D2D"
+            for s in best_signals:
+                chg_color = "#0F6E56" if s["price_chg"] >= 0 else "#A32D2D"
+                ok_text   = "✅ 正確" if s["correct"] else "❌ 錯誤"
+                ok_color  = "#0F6E56" if s["correct"] else "#A32D2D"
                 sig_rows.append(html.Tr([
-                    html.Td(s["date"],style={"padding":"4px 8px"}),
-                    html.Td(f"${s['bp']:.2f}",style={"padding":"4px 8px"}),
-                    html.Td(f"${s['sp']:.2f}",style={"padding":"4px 8px"}),
-                    html.Td(f"{'+' if s['ret']>=0 else ''}{s['ret']}%",
-                            style={"padding":"4px 8px","color":ret_color,"fontWeight":"500"}),
-                    html.Td(f"{s['missed']}%",style={"padding":"4px 8px"}),
-                    html.Td(f"+{s['slope']}%",style={"padding":"4px 8px","color":"#0F6E56"}),
+                    html.Td(s["type"],
+                            style={"padding":"4px 8px",
+                                   "color":"#0F6E56" if s["type"]=="負轉正" else "#A32D2D",
+                                   "fontWeight":"500"}),
+                    html.Td(s["entry_date"],style={"padding":"4px 8px"}),
+                    html.Td(s["exit_date"], style={"padding":"4px 8px"}),
+                    html.Td(f"{s['duration']} 天",style={"padding":"4px 8px"}),
+                    html.Td(f"${s['entry_price']:.2f}",style={"padding":"4px 8px"}),
+                    html.Td(f"${s['exit_price']:.2f}", style={"padding":"4px 8px"}),
+                    html.Td(f"{'+' if s['price_chg']>=0 else ''}{s['price_chg']}%",
+                            style={"padding":"4px 8px","color":chg_color,"fontWeight":"500"}),
+                    html.Td(ok_text, style={"padding":"4px 8px","color":ok_color,"fontWeight":"500"}),
                 ]))
 
+            th_style = {"padding":"4px 8px","textAlign":"left","fontSize":"12px",
+                        "color":"#888","borderBottom":"0.5px solid #eee"}
             detail_table = html.Div([
-                html.P(f"最佳視窗（{best['win']}天）訊號明細：",
-                       style={"fontSize":"12px","color":"#888","margin":"8px 0 4px"}),
-                html.Table([
+                html.P(f"最佳視窗（{best_win}天）訊號明細：",
+                       style={"fontSize":"12px","color":"#888","margin":"8px 0 4px","paddingLeft":"12px"}),
+                html.Div(html.Table([
                     html.Thead(html.Tr([
-                        html.Th("買入日",style={"padding":"4px 8px","textAlign":"left","fontSize":"12px","color":"#888","borderBottom":"0.5px solid #eee"}),
-                        html.Th("買入價",style={"padding":"4px 8px","textAlign":"left","fontSize":"12px","color":"#888","borderBottom":"0.5px solid #eee"}),
-                        html.Th(f"賣出價(+{hold_days}天)",style={"padding":"4px 8px","textAlign":"left","fontSize":"12px","color":"#888","borderBottom":"0.5px solid #eee"}),
-                        html.Th("報酬",style={"padding":"4px 8px","textAlign":"left","fontSize":"12px","color":"#888","borderBottom":"0.5px solid #eee"}),
-                        html.Th("錯過底部",style={"padding":"4px 8px","textAlign":"left","fontSize":"12px","color":"#888","borderBottom":"0.5px solid #eee"}),
-                        html.Th("當日斜率",style={"padding":"4px 8px","textAlign":"left","fontSize":"12px","color":"#888","borderBottom":"0.5px solid #eee"}),
+                        html.Th("訊號類型",style=th_style),
+                        html.Th("進場日",style=th_style),
+                        html.Th("出場日",style=th_style),
+                        html.Th("持續天數",style=th_style),
+                        html.Th("進場價",style=th_style),
+                        html.Th("出場價",style=th_style),
+                        html.Th("股價變化",style=th_style),
+                        html.Th("預測",style=th_style),
                     ])),
                     html.Tbody(sig_rows),
                 ],style={"width":"100%","borderCollapse":"collapse","fontSize":"12px"}),
-            ]) if best["signals"] else html.P("無訊號",style={"fontSize":"12px","color":"#aaa"})
+                style={"overflowX":"auto","paddingBottom":"8px"}),
+            ])
 
             backtest_divs.append(html.Div([
                 dcc.Graph(figure=fig_bt, config={"displayModeBar":False}),
                 detail_table,
             ],style={"marginBottom":"20px","border":"0.5px solid #e5e5e5",
-                     "borderRadius":"10px","overflow":"hidden","background":"white","padding":"0 0 12px"}))
+                     "borderRadius":"10px","overflow":"hidden","background":"white","paddingBottom":"12px"}))
 
         content = html.Div(backtest_divs)
 
@@ -518,8 +589,7 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
     if has_vix or has_fng:
         fear_fig = make_subplots(specs=[[{"secondary_y":True}]])
         if has_vix:
-            vx = sorted(vix_data.keys())
-            vy = [vix_data[d] for d in vx]
+            vx = sorted(vix_data.keys()); vy = [vix_data[d] for d in vx]
             fear_fig.add_trace(go.Scatter(x=vx,y=vy,name="VIX",mode="lines",
                 line=dict(color="rgb(220,72,61)",width=1.8),fill="tozeroy",fillcolor="rgba(220,72,61,0.12)",
                 hovertemplate="%{x}<br>VIX: %{y:.2f}<extra></extra>"),secondary_y=False)
@@ -529,8 +599,7 @@ def update_content(n_clicks, tab, ticker_str, window, show_volume, days):
         else:
             fear_notes.append("❌ VIX 無資料")
         if has_fng:
-            fg = sorted(fng_data.keys())
-            fv = [fng_data[d] for d in fg]
+            fg = sorted(fng_data.keys()); fv = [fng_data[d] for d in fg]
             fear_fig.add_trace(go.Scatter(x=fg,y=fv,name="Fear & Greed",mode="lines",
                 line=dict(color="rgb(214,140,0)",width=1.8),
                 hovertemplate="%{x}<br>F&G: %{y:.0f}<extra></extra>"),secondary_y=True)
