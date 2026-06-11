@@ -1,5 +1,5 @@
 """
-股票滾動年化斜率互動圖表（Render 部署版）
+股票滾動年化斜率互動圖表（含成交量版）
 """
 
 import datetime, math
@@ -40,16 +40,20 @@ def fetch_yahoo(ticker, year):
         raise RuntimeError("找不到資料")
     result = result[0]
     timestamps = result["timestamp"]
-    closes_raw = result["indicators"]["quote"][0]["close"]
-    dates, closes = [], []
-    for ts, c in zip(timestamps, closes_raw):
+    quote = result["indicators"]["quote"][0]
+    closes_raw = quote.get("close", [])
+    volumes_raw = quote.get("volume", [])
+
+    dates, closes, volumes = [], [], []
+    for ts, c, v in zip(timestamps, closes_raw, volumes_raw):
         if c is None:
             continue
         dates.append(datetime.datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d"))
         closes.append(float(c))
+        volumes.append(float(v) if v is not None else 0.0)
     if not dates:
         raise RuntimeError(f"{ticker} {year} 年無資料")
-    return dates, closes
+    return dates, closes, volumes
 
 def rolling_annualized_log_slope(closes, window):
     n = len(closes)
@@ -70,13 +74,13 @@ def rolling_annualized_log_slope(closes, window):
     return out
 
 app = dash.Dash(__name__)
-server = app.server  # Render 需要這行
+server = app.server
 app.title = "股票滾動年化斜率"
 
 app.layout = html.Div([
-    html.H2("股票收盤價 × 滾動年化斜率",
+    html.H2("股票收盤價 × 滾動年化斜率 × 成交量",
             style={"fontFamily": "sans-serif", "marginBottom": "4px"}),
-    html.P("每支股票獨立一張圖，斜率與股價一起顯示",
+    html.P("每支股票獨立一張圖，上方為斜率與股價，下方為成交量",
            style={"fontFamily": "sans-serif", "color": "#888", "marginBottom": "16px"}),
 
     html.Div([
@@ -147,7 +151,7 @@ def update_charts(n_clicks, ticker_str, year, window):
     for i, ticker in enumerate(tickers[:12]):
         color = COLORS[i % len(COLORS)]
         try:
-            dates, closes = fetch_yahoo(ticker, year)
+            dates, closes, volumes = fetch_yahoo(ticker, year)
         except Exception as e:
             messages.append(f"❌ {ticker}: {e}")
             chart_divs.append(html.Div(
@@ -163,35 +167,64 @@ def update_charts(n_clicks, ticker_str, year, window):
         pos_s = [v if (v is not None and v > 0) else 0 for v in slope_line]
         neg_s = [v if (v is not None and v < 0) else 0 for v in slope_line]
 
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        # 成交量顏色：漲綠跌紅
+        vol_colors = []
+        for k in range(len(closes)):
+            if k == 0:
+                vol_colors.append("rgba(150,150,150,0.5)")
+            elif closes[k] >= closes[k - 1]:
+                vol_colors.append("rgba(34,160,107,0.5)")
+            else:
+                vol_colors.append("rgba(226,72,61,0.5)")
 
+        # 上方斜率+股價，下方成交量，高度比例 7:3
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            row_heights=[0.68, 0.32],
+            vertical_spacing=0.04,
+            specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
+        )
+
+        # 上方：斜率填色
         fig.add_trace(go.Bar(
             x=dates, y=pos_s, name="上升",
             marker_color="rgba(34,160,107,0.35)", showlegend=False,
             hovertemplate="%{x}<br>斜率: %{y:.1f}%<extra></extra>",
-        ), secondary_y=False)
+        ), row=1, col=1, secondary_y=False)
 
         fig.add_trace(go.Bar(
             x=dates, y=neg_s, name="下跌",
             marker_color="rgba(226,72,61,0.35)", showlegend=False,
             hovertemplate="%{x}<br>斜率: %{y:.1f}%<extra></extra>",
-        ), secondary_y=False)
+        ), row=1, col=1, secondary_y=False)
 
+        # 上方：斜率折線
         fig.add_trace(go.Scatter(
             x=dates, y=slope_line,
             name=f"{window}日年化斜率", mode="lines",
             line=dict(color="#444", width=1.2),
             hovertemplate="%{x}<br>斜率: %{y:.2f}%<extra></extra>",
-        ), secondary_y=False)
+        ), row=1, col=1, secondary_y=False)
 
+        # 上方：股價折線（右軸）
         fig.add_trace(go.Scatter(
             x=dates, y=closes,
             name="收盤價", mode="lines",
             line=dict(color=color, width=2),
             hovertemplate="%{x}<br>收盤: $%{y:.2f}<extra></extra>",
-        ), secondary_y=True)
+        ), row=1, col=1, secondary_y=True)
 
-        fig.add_hline(y=0, line_color="#ccc", line_width=1, secondary_y=False)
+        # 下方：成交量
+        fig.add_trace(go.Bar(
+            x=dates, y=volumes,
+            name="成交量",
+            marker_color=vol_colors,
+            hovertemplate="%{x}<br>成交量: %{y:,.0f}<extra></extra>",
+        ), row=2, col=1)
+
+        fig.add_hline(y=0, line_color="#ccc", line_width=1, row=1, col=1,
+                      secondary_y=False)
 
         fig.update_layout(
             title=dict(
@@ -203,18 +236,29 @@ def update_charts(n_clicks, ticker_str, year, window):
             legend=dict(orientation="h", yanchor="bottom", y=1.06,
                         xanchor="right", x=1, font=dict(size=11)),
             plot_bgcolor="white", paper_bgcolor="white",
-            margin=dict(l=55, r=60, t=50, b=40),
-            xaxis=dict(showgrid=True, gridcolor="#eee"),
+            margin=dict(l=60, r=65, t=50, b=40),
             font=dict(family="sans-serif", size=12),
-            height=300,
+            height=420,
         )
-        fig.update_yaxes(title_text="年化斜率 (%)", secondary_y=False,
+
+        # 上方 x 軸（隱藏，共用）
+        fig.update_xaxes(showgrid=True, gridcolor="#eee", row=1, col=1)
+        # 下方 x 軸
+        fig.update_xaxes(showgrid=True, gridcolor="#eee", row=2, col=1)
+
+        # 上方左軸：斜率
+        fig.update_yaxes(title_text="年化斜率(%)", secondary_y=False,
                          showgrid=True, gridcolor="#eee", zeroline=False,
-                         title_font=dict(size=11))
-        fig.update_yaxes(title_text="收盤價 (USD)", secondary_y=True,
+                         title_font=dict(size=10), row=1, col=1)
+        # 上方右軸：股價
+        fig.update_yaxes(title_text="收盤價(USD)", secondary_y=True,
                          showgrid=False, zeroline=False,
-                         title_font=dict(size=11, color=color),
-                         tickfont=dict(color=color))
+                         title_font=dict(size=10, color=color),
+                         tickfont=dict(color=color), row=1, col=1)
+        # 下方左軸：成交量
+        fig.update_yaxes(title_text="成交量", showgrid=True, gridcolor="#eee",
+                         zeroline=False, title_font=dict(size=10),
+                         tickformat=".2s", row=2, col=1)
 
         chart_divs.append(html.Div(
             dcc.Graph(figure=fig, config={"displayModeBar": False}),
