@@ -1590,8 +1590,8 @@ def build_option_line_msg(ticker):
             key = "top_puts" if side=="put" else "top_calls"
             return sum(1 for ed in exp_data if strike in [r[0] for r in ed[key]]) >= 2
 
-        dual_puts  = [(k,v) for k,v in [(k,all_puts[k])  for k in top_put_strikes  if k<spot]  if dual(k,"put")]
-        dual_calls = [(k,v) for k,v in [(k,all_calls[k]) for k in top_call_strikes if k>spot] if dual(k,"call")]
+        dual_puts  = [(k,v) for k,v in [(k,all_puts[k])  for k in top_put_strikes  if k<spot]  if dual(k,"put")]  if exp_data else []
+        dual_calls = [(k,v) for k,v in [(k,all_calls[k]) for k in top_call_strikes if k>spot] if dual(k,"call")] if exp_data else []
 
         put_str  = "　".join([f"${k:.0f}(✅雙月)" for k,v in dual_puts[:2]]  or [f"${k:.0f}" for k,v in support[:2]])
         call_str = "　".join([f"${k:.0f}(✅雙月)" for k,v in dual_calls[:2]] or [f"${k:.0f}" for k,v in resist[:2]])
@@ -1768,8 +1768,12 @@ app.layout = html.Div([
         html.Button("發送目前斜率",id="slope-btn",n_clicks=0,
                     style={"alignSelf":"flex-end","padding":"8px 16px","background":"#2563eb",
                            "color":"#fff","border":"none","borderRadius":"6px","cursor":"pointer","fontSize":"13px"}),
+        html.Button("📤 發送期權結構",id="send-opt-now-btn",n_clicks=0,
+                    style={"alignSelf":"flex-end","padding":"8px 16px","background":"#7c3aed",
+                           "color":"#fff","border":"none","borderRadius":"6px","cursor":"pointer","fontSize":"13px"}),
     ],style={"display":"flex","flexWrap":"wrap","gap":"16px","alignItems":"flex-end",
              "background":"#f5f5f3","borderRadius":"10px","padding":"14px 16px","marginBottom":"8px"}),
+    html.Div(id="send-opt-now-msg",style={"fontSize":"13px","color":"#7c3aed","minHeight":"20px","marginBottom":"2px","fontFamily":"sans-serif"}),
 
     html.Div([
         html.Label("⏰ 定時發送設定（台灣時間）",
@@ -2061,6 +2065,26 @@ def send_current_slope(n):
 
     send_line("\n\n".join(blocks))
     return "✅ 斜率報告已發送到 LINE"
+
+
+@app.callback(
+    Output("send-opt-now-msg","children"),
+    Input("send-opt-now-btn","n_clicks"),
+    State("schedule-opt-ticker","value"),
+    prevent_initial_call=True,
+)
+def send_opt_now(n_clicks, ticker_input):
+    if not n_clicks:
+        return ""
+    ticker = (ticker_input or SCHEDULE_OPT_TICKER or "QQQ").strip().upper()
+    try:
+        msg = build_option_line_msg(ticker)
+        if msg:
+            send_line(msg)
+            return f"✅ 已發送 {ticker} 期權結構到 LINE"
+        return "❌ 無法產生期權訊息"
+    except Exception as e:
+        return f"❌ 發送失敗：{e}"
 
 
 @app.callback(
