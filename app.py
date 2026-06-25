@@ -3678,10 +3678,26 @@ def update_options(n_clicks, ticker_input):
             cat  = exp_info["cat"]
             try:
                 import time
-                time.sleep(0.5)  # 每次請求間隔 0.5 秒
+                time.sleep(0.5)
                 chain = t.option_chain(e)
-                puts  = chain.puts[["strike","openInterest","impliedVolatility"]].dropna()
-                calls = chain.calls[["strike","openInterest","impliedVolatility"]].dropna()
+
+                # ── 診斷：檢查原始 chain ──
+                raw_puts  = chain.puts
+                raw_calls = chain.calls
+                print(f"[期權診斷] {e} 原始 puts={len(raw_puts)} calls={len(raw_calls)}")
+                if len(raw_puts) > 0:
+                    print(f"  Put  OI={raw_puts['openInterest'].min():.0f}~{raw_puts['openInterest'].max():.0f}"
+                          f"  K=${raw_puts['strike'].min():.0f}~${raw_puts['strike'].max():.0f}")
+                if len(raw_calls) > 0:
+                    print(f"  Call OI={raw_calls['openInterest'].min():.0f}~{raw_calls['openInterest'].max():.0f}"
+                          f"  K=${raw_calls['strike'].min():.0f}~${raw_calls['strike'].max():.0f}")
+                if raw_puts.empty and raw_calls.empty:
+                    print(f"  ⚠️ {e} chain 完全空白，API 問題")
+                    continue
+
+                puts  = raw_puts[["strike","openInterest","impliedVolatility"]].dropna()
+                calls = raw_calls[["strike","openInterest","impliedVolatility"]].dropna()
+                print(f"  dropna後 puts={len(puts)} calls={len(calls)}")
 
                 # 過濾：OI > 100 且 ±15% 範圍
                 puts  = puts[(puts["openInterest"] > 100) &
@@ -3690,6 +3706,9 @@ def update_options(n_clicks, ticker_input):
                 calls = calls[(calls["openInterest"] > 100) &
                               (calls["strike"] >= spot * 0.85) &
                               (calls["strike"] <= spot * 1.15)]
+                print(f"  過濾後 puts={len(puts)} calls={len(calls)} "
+                      f"(現價${spot:.0f} 範圍${spot*0.85:.0f}~${spot*1.15:.0f})")
+
 
                 if cat in ("0DTE","Weekly"):
                     short_term_count += len(puts) + len(calls)
