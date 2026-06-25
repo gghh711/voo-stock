@@ -1538,7 +1538,9 @@ def build_option_line_msg(ticker):
         exp_data  = []
         all_puts  = {}
         all_calls = {}
-        for e in exps[:2]:
+        # 跳過今天或已過期的到期日，取未來2個有效到期日
+        valid_exps = [e for e in exps if datetime.date.fromisoformat(e) > today]
+        for e in valid_exps[:2]:
             ed   = datetime.date.fromisoformat(e)
             days = (ed - today).days
             try:
@@ -1580,6 +1582,12 @@ def build_option_line_msg(ticker):
                 sug = f"🔴 接近阻力 ${main_res[0]:.0f}（差 {d_res:.1f}%），可考慮減倉"
             else:
                 sug = f"⚪ 區間中段　支撐 ${main_sup[0]:.0f}（-{d_sup:.1f}%）　阻力 ${main_res[0]:.0f}（+{d_res:.1f}%）"
+        elif main_sup:
+            sug = f"⚪ 支撐 ${main_sup[0]:.0f}，暫無明顯上方阻力"
+        elif main_res:
+            sug = f"⚪ 阻力 ${main_res[0]:.0f}，暫無明顯下方支撐"
+        else:
+            sug = "⚪ 期權數據不足，無法判斷支撐阻力"
 
         # 歷史追蹤
         put_note, call_note = track_option_wall(
@@ -3524,11 +3532,17 @@ def update_options(n_clicks, ticker_input):
 
         today   = datetime.date.today()
 
-        # 找最近4個到期日
+        # 找最近4個有效到期日（跳過今天到期或已過期）
         exp_dates = []
         for e in exps[:8]:
             ed = datetime.date.fromisoformat(e)
+            if ed <= today:
+                continue  # 跳過今天及已過期
             exp_dates.append((e, ed, (ed - today).days))
+
+        if not exp_dates:
+            return html.P("目前無有效期權到期日（今日結算日，請明天再查）",
+                          style={"color":"#d97706","fontSize":"13px"})
 
         # 抓近月和次月
         near_exps  = exp_dates[:2]
@@ -3649,6 +3663,10 @@ def update_options(n_clicks, ticker_input):
             exp_line  = (f"📅 結算日 {next_exp['exp']}（{next_exp['days']}天後）"
                         f"{'　'+gamma_tag if gamma_tag else ''}{'　'+opex_tag if opex_tag else ''}")
 
+        # 跨月雙重確認（提前計算，供 LINE 訊息和 UI 使用）
+        dual_puts  = [(k, all_puts[k])  for k in top_put_strikes  if dual_confirm(k, exp_data,"put")]
+        dual_calls = [(k, all_calls[k]) for k in top_call_strikes if dual_confirm(k, exp_data,"call")]
+
         top_put_str  = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_puts or support_strikes)[:2]])
         top_call_str = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_calls or resist_strikes)[:2]])
 
@@ -3703,12 +3721,9 @@ def update_options(n_clicks, ticker_input):
             ], style={"background":"white","borderRadius":"10px","padding":"12px 14px",
                       "border":"0.5px solid #e5e5e5","marginBottom":"10px"}))
 
-        # 跨月雙重確認
+        # 跨月雙重確認 UI
         max_put_oi  = max(all_puts.values())  if all_puts  else 1
         max_call_oi = max(all_calls.values()) if all_calls else 1
-
-        dual_puts  = [(k, all_puts[k])  for k in top_put_strikes  if dual_confirm(k, exp_data,"put")]
-        dual_calls = [(k, all_calls[k]) for k in top_call_strikes if dual_confirm(k, exp_data,"call")]
 
         dual_box = html.Div([
             html.Div("🔗 跨月雙重確認（近月+次月同時存在 → 訊號更強）",
