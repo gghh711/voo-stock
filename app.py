@@ -2,7 +2,7 @@
 股票滾動年化斜率 + 恐懼指標 + LINE 通知 + 回測功能
 """
 
-import datetime, math, os, threading
+import datetime, math, os, json, threading
 from datetime import timezone
 import requests
 import plotly.graph_objects as go
@@ -25,7 +25,9 @@ TICKER_NAMES = {
     "^SOX":   "費城半導體",
 }
 # 定時發送時間（台灣時間，UTC = 台灣時間 - 8）
-SCHEDULE_HOURS_TW = [20, 22]  # 可由使用者更改
+SCHEDULE_HOURS_TW   = [20, 22]   # 可由使用者更改
+SCHEDULE_CONTENT    = ["slope"]  # "slope" / "option" / 兩者
+SCHEDULE_OPT_TICKER = "QQQ"      # 期權分析標的
 
 COLORS = ["#2563eb","#16a34a","#dc2626","#d97706","#7c3aed","#0891b2","#db2777","#65a30d","#b45309","#0f766e"]
 HEADERS = {"User-Agent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36","Accept":"application/json","Referer":"https://finance.yahoo.com"}
@@ -174,6 +176,384 @@ def rolling_annualized_log_slope(closes, window, annualize=252):
         b = Sxy / Sxx
         out[i] = (math.exp(b*annualize)-1)*100
     return out
+
+def slope_state(cur, prev):
+    """六狀態斜率分類"""
+    if cur is None or prev is None or math.isnan(cur) or math.isnan(prev):
+        return "未知"
+    if prev > 0 and cur > 0:
+        return "加速上升" if cur > prev else "減速上升"
+    elif prev < 0 and cur < 0:
+        return "加速下跌" if cur < prev else "減速下跌"
+    elif prev < 0 and cur > 0:
+        return "由負轉正"
+    elif prev > 0 and cur < 0:
+        return "由正轉負"
+    elif prev == 0 or cur == 0:
+        return "減速上升" if cur >= 0 else "減速下跌"
+    return "未知"
+
+def analyze_six_states(day_closes, dates_d, w_l1=120, w_l2=40, w_l3=10, forward_days=5):
+    """
+    分析 L1/L2/L3 六狀態組合：
+    - 平均報酬：從進場日持有到今天
+    - 短期報酬：進場後 forward_days 天的報酬（用於找出場訊號）
+    """
+    s_mo  = rolling_annualized_log_slope(day_closes, w_l1, 252)
+    s_wk  = rolling_annualized_log_slope(day_closes, w_l2, 252)
+    s_day = rolling_annualized_log_slope(day_closes, w_l3, 252)
+    N = len(day_closes)
+    last_price = day_closes[-1]
+
+    combo_results = {}
+
+    for i in range(1, N - forward_days - 1):
+        c1, p1 = s_mo[i],  s_mo[i-1]
+        c2, p2 = s_wk[i],  s_wk[i-1]
+        c3, p3 = s_day[i], s_day[i-1]
+        if any(math.isnan(x) for x in [c1,p1,c2,p2,c3,p3]):
+            continue
+
+        st1 = slope_state(c1, p1)
+        st2 = slope_state(c2, p2)
+        st3 = slope_state(c3, p3)
+        if "未知" in (st1, st2, st3):
+            continue
+
+        entry_price = day_closes[i]
+        # 持有到今天的報酬
+        hold_ret  = (last_price - entry_price) / entry_price * 100
+        # 未來 N 天短期報酬（用於判斷出場）
+        fwd_ret   = (day_closes[i + forward_days] - entry_price) / entry_price * 100
+
+        key = (st1, st2, st3)
+        combo_results.setdefault(key, []).append({
+            "hold_ret": hold_ret,
+            "fwd_ret":  fwd_ret,
+            "date":     dates_d[i],
+            "entry":    entry_price,
+        })
+
+    bah_total = round((last_price - day_closes[0]) / day_closes[0] * 100, 2)
+
+    summary = []
+    for key, records in combo_results.items():
+        if len(records) < 3:
+            continue
+        hold_rets = [r["hold_ret"] for r in records]
+        fwd_rets  = [r["fwd_ret"]  for r in records]
+        avg_hold  = round(sum(hold_rets) / len(hold_rets), 2)
+        avg_fwd   = round(sum(fwd_rets)  / len(fwd_rets),  2)
+        win_hold  = round(sum(1 for r in hold_rets if r > 0) / len(hold_rets) * 100, 1)
+        win_fwd   = round(sum(1 for r in fwd_rets  if r > 0) / len(fwd_rets)  * 100, 1)
+        best      = round(max(hold_rets), 1)
+        worst     = round(min(hold_rets), 1)
+        summary.append({
+            "l1": key[0], "l2": key[1], "l3": key[2],
+            "avg_ret":  avg_hold,   # 持有到今報酬
+            "avg_fwd":  avg_fwd,    # 短期 N 天報酬
+            "win_rate": win_hold,
+            "win_fwd":  win_fwd,
+            "best":     best,
+            "worst":    worst,
+            "count":    len(records),
+        })
+
+    # 進場排名：持有到今報酬由高到低
+    summary_entry = sorted(summary, key=lambda x: x["avg_ret"], reverse=True)
+    # 出場排名：未來 N 天報酬由低到高（最差的先出）
+    summary_exit  = sorted(summary, key=lambda x: x["avg_fwd"])
+
+    return summary_entry, summary_exit, bah_total
+
+
+def paired_backtest(day_closes, dates_d, entry_combos, exit_combos,
+                    w_l1=120, w_l2=40, w_l3=10, capital=100000):
+    """
+    配對回測：
+    - entry_combos：進場組合集合（set of (l1,l2,l3) tuples）
+    - exit_combos ：出場組合集合
+    從頭到尾掃描，遇到進場訊號就買入，遇到出場訊號就賣出
+    回傳每筆交易、最終資產、買入持有對比
+    """
+    s_mo  = rolling_annualized_log_slope(day_closes, w_l1, 252)
+    s_wk  = rolling_annualized_log_slope(day_closes, w_l2, 252)
+    s_day = rolling_annualized_log_slope(day_closes, w_l3, 252)
+    N = len(day_closes)
+
+    cash   = float(capital)
+    shares = 0.0
+    trades = []
+    equity = []
+    peak   = cash
+    max_dd = 0.0
+
+    for i in range(1, N):
+        c1 = s_mo[i];  p1 = s_mo[i-1]
+        c2 = s_wk[i];  p2 = s_wk[i-1]
+        c3 = s_day[i]; p3 = s_day[i-1]
+        if any(math.isnan(x) for x in [c1,p1,c2,p2,c3,p3]):
+            val = cash + shares * day_closes[i]
+            equity.append({"date":dates_d[i],"val":val})
+            continue
+
+        st1 = slope_state(c1, p1)
+        st2 = slope_state(c2, p2)
+        st3 = slope_state(c3, p3)
+        price = day_closes[i]
+        date  = dates_d[i]
+        combo = (st1, st2, st3)
+
+        # 出場優先
+        if shares > 0 and combo in exit_combos:
+            proceeds = shares * price
+            cash += proceeds
+            trades.append({"action":"賣出","date":date,"price":round(price,2),
+                           "combo":f"{st1}+{st2}+{st3}",
+                           "amount":round(proceeds,2),"cash_after":round(cash,2)})
+            shares = 0.0
+        # 進場
+        elif shares == 0 and combo in entry_combos and cash > 0.01:
+            shares = cash / price
+            trades.append({"action":"買入","date":date,"price":round(price,2),
+                           "combo":f"{st1}+{st2}+{st3}",
+                           "amount":round(cash,2),"cash_after":0})
+            cash = 0.0
+
+        val    = cash + shares * price
+        peak   = max(peak, val)
+        max_dd = max(max_dd, (peak - val) / peak * 100)
+        equity.append({"date":date,"val":val})
+
+    final_val = cash + day_closes[-1] * shares
+    total_ret = round((final_val - capital) / capital * 100, 2)
+    bah_ret   = round((day_closes[-1] - day_closes[0]) / day_closes[0] * 100, 2)
+    return {
+        "final_val": round(final_val, 2),
+        "total_ret": total_ret,
+        "bah_ret":   bah_ret,
+        "bah_final": round(capital * (1 + bah_ret/100), 2),
+        "max_dd":    round(max_dd, 1),
+        "trades":    trades,
+        "equity":    equity,
+        "dates":     dates_d,
+        "closes":    day_closes,
+    }
+
+
+def run_mtf_sim(day_closes, dates_d, w_l1, w_l2, w_l3, capital=100000):
+    """
+    用指定視窗跑三層確認策略回測，回傳績效指標
+    w_l1: L1 月線視窗（日數）
+    w_l2: L2 週線視窗（日數）
+    w_l3: L3 日線視窗（日數）
+    """
+    if len(day_closes) < max(w_l1, w_l2, w_l3) + 5:
+        return None
+
+    s_mo  = rolling_annualized_log_slope(day_closes, w_l1, 252)
+    s_wk  = rolling_annualized_log_slope(day_closes, w_l2, 252)
+    s_day = rolling_annualized_log_slope(day_closes, w_l3, 252)
+
+    N = len(day_closes)
+    cash = float(capital)
+    shares = 0.0
+    peak = cash
+    max_dd = 0.0
+    trade_count = 0
+
+    for i in range(2, N):
+        d_slope = s_day[i]   if not math.isnan(s_day[i])   else 0
+        d_prev  = s_day[i-1] if not math.isnan(s_day[i-1]) else 0
+        d_prev2 = s_day[i-2] if not math.isnan(s_day[i-2]) else 0
+        w_slope = s_wk[i]    if not math.isnan(s_wk[i])    else 0
+        m_slope = s_mo[i]    if not math.isnan(s_mo[i])    else 0
+        price   = day_closes[i]
+
+        # 出場：L2 轉負
+        if shares > 0 and w_slope < 0:
+            cash += shares * price
+            shares = 0.0
+
+        elif m_slope > 0 and w_slope > 0:
+            flatten      = d_slope < 0 and d_prev < 0 and abs(d_slope) < abs(d_prev)
+            was_expanding= d_prev < 0 and d_prev2 < 0 and abs(d_prev) > abs(d_prev2)
+            n2p          = d_prev < 0 and d_slope > 0
+            best_allin   = flatten and was_expanding
+
+            if best_allin and cash > 0.01:
+                shares += cash / price; cash = 0.0; trade_count += 1
+            elif flatten and not was_expanding:
+                amt = cash * 0.5
+                if amt > 0.01:
+                    shares += amt / price; cash -= amt; trade_count += 1
+            elif n2p and cash > 0.01:
+                shares += cash / price; cash = 0.0; trade_count += 1
+            elif d_slope > 0 and shares == 0 and cash > 0.01:
+                shares += cash / price; cash = 0.0; trade_count += 1
+
+        val = cash + shares * day_closes[i]
+        peak = max(peak, val)
+        max_dd = max(max_dd, (peak - val) / peak * 100)
+
+    final_val = cash + day_closes[-1] * shares
+    total_ret = round((final_val - capital) / capital * 100, 2)
+    bah_ret   = round((day_closes[-1] - day_closes[0]) / day_closes[0] * 100, 2)
+    return {
+        "total_ret": total_ret,
+        "final_val": final_val,
+        "bah_ret":   bah_ret,
+        "max_dd":    round(max_dd, 1),
+        "trade_count": trade_count,
+        "beat_bah":  final_val > capital * (1 + bah_ret/100),
+    }
+
+
+def multi_timeframe_strategy(ticker_sym, end_dt, capital=100000):
+    """
+    三層多時間框架確認策略（只抓一次日線，月/週用日線計算）：
+    L1 月線方向：用 120 日斜率（約 6 個月）代表月線
+    L2 週線方向：用  40 日斜率（約 8 週）代表週線
+    L3 日線進場：10 日斜率跌勢趨緩 or 負轉正
+    進場：L1>0 且 L2>0 且 L3觸發
+    出場：週線方向（40日斜率）轉負
+    """
+    try:
+        start_dt = end_dt - datetime.timedelta(days=365*3)
+        dates_d, day_closes, _, _ = fetch_yahoo_range(ticker_sym, start_dt, end_dt, "1d")
+    except Exception as e:
+        return None, None, None, str(e)
+
+    if len(day_closes) < 130:
+        return None, None, None, f"資料不足（只有 {len(day_closes)} 筆，需要至少 130 筆）"
+
+    # 三層斜率
+    s_mo  = rolling_annualized_log_slope(day_closes, 120, 252)  # L1 月線方向
+    s_wk  = rolling_annualized_log_slope(day_closes,  40, 252)  # L2 週線方向
+    s_day = rolling_annualized_log_slope(day_closes,  10, 252)  # L3 日線進場
+
+    # 最新值與前一個有效值
+    def latest(slopes):
+        return next((s for s in reversed(slopes) if not math.isnan(s)), None)
+
+    def prev_val(slopes):
+        # 找最後一個有效值的前一個有效值
+        valid_idx = [i for i, s in enumerate(slopes) if not math.isnan(s)]
+        if len(valid_idx) < 2:
+            return None
+        return slopes[valid_idx[-2]]
+
+    mo_cur  = latest(s_mo)
+    wk_cur  = latest(s_wk)
+    day_cur = latest(s_day)
+    day_prev = prev_val(s_day)
+    wk_prev  = prev_val(s_wk)
+
+    l1_ok  = mo_cur  is not None and mo_cur  > 0
+    l2_ok  = wk_cur  is not None and wk_cur  > 0
+    l3_ok  = (day_cur is not None and day_prev is not None and
+               day_cur < 0 and day_prev < 0 and abs(day_cur) < abs(day_prev))  # 跌勢趨緩
+    l3_n2p = (day_cur is not None and day_prev is not None and
+               day_prev < 0 and day_cur > 0)                                    # 負轉正
+    l3_pos = (day_cur is not None and day_cur > 0)                              # 正斜率（動能向上）
+
+    # 模擬交易
+    N    = len(day_closes)
+    cash = float(capital)
+    shares = 0.0
+    trades = []
+    equity = []
+    peak   = cash
+    max_dd = 0.0
+
+    for i in range(1, N):
+        d_slope = s_day[i]  if not math.isnan(s_day[i])  else 0
+        d_prev  = s_day[i-1] if not math.isnan(s_day[i-1]) else 0
+        w_slope = s_wk[i]   if not math.isnan(s_wk[i])   else 0
+        m_slope = s_mo[i]   if not math.isnan(s_mo[i])   else 0
+        price   = day_closes[i]
+        date    = dates_d[i]
+
+        # 出場：週線轉負
+        if shares > 0 and w_slope < 0:
+            proceeds = shares * price
+            cash    += proceeds
+            trades.append({"action":"賣出","date":date,"price":price,
+                           "amount":round(proceeds,2),"cash_after":round(cash,2)})
+            shares = 0.0
+
+        # 進場：L1>0 且 L2>0 且 L3觸發
+        elif m_slope > 0 and w_slope > 0:
+            d_prev2 = s_day[i-2] if i >= 2 and not math.isnan(s_day[i-2]) else None
+
+            flatten      = d_slope < 0 and d_prev < 0 and abs(d_slope) < abs(d_prev)
+            was_expanding= d_prev2 is not None and d_prev < 0 and d_prev2 < 0 and abs(d_prev) > abs(d_prev2)
+            n2p          = d_prev < 0 and d_slope > 0
+
+            # 最佳 ALL IN：前一天跌勢擴大 → 今天跌勢趨緩（轉折點）
+            best_allin = flatten and was_expanding
+
+            if best_allin and cash > 0.01:
+                amt = cash
+                shares += amt / price
+                cash    = 0.0
+                trades.append({"action":"買入(ALL IN 最佳)","date":date,"price":price,
+                               "amount":round(amt,2),"cash_after":round(cash,2)})
+            elif flatten and not was_expanding:
+                # 跌勢趨緩但前一天不是擴大 → 分批 50%
+                amt = cash * 0.5
+                if amt > 0.01:
+                    shares += amt / price
+                    cash   -= amt
+                    trades.append({"action":"買入(50%)","date":date,"price":price,
+                                   "amount":round(amt,2),"cash_after":round(cash,2)})
+            elif n2p and cash > 0.01:
+                # 負轉正 → ALL IN
+                amt = cash
+                shares += amt / price
+                cash    = 0.0
+                trades.append({"action":"買入(ALL IN)","date":date,"price":price,
+                               "amount":round(amt,2),"cash_after":round(cash,2)})
+            elif d_slope > 0 and shares == 0 and cash > 0.01:
+                # 三層都正但還沒持股 → ALL IN
+                amt = cash
+                shares += amt / price
+                cash    = 0.0
+                trades.append({"action":"買入(ALL IN)","date":date,"price":price,
+                               "amount":round(amt,2),"cash_after":round(cash,2)})
+
+        val    = cash + shares * price
+        peak   = max(peak, val)
+        max_dd = max(max_dd, (peak - val) / peak * 100)
+        equity.append({"date":date,"val":val})
+
+    final_val = cash + day_closes[-1] * shares
+    total_ret = round((final_val - capital) / capital * 100, 2)
+    bah_ret   = round((day_closes[-1] - day_closes[0]) / day_closes[0] * 100, 2)
+    bah_final = round(capital * (1 + bah_ret/100), 0)
+
+    signals = {
+        "mo_cur":   round(mo_cur,   1) if mo_cur   is not None else None,
+        "wk_cur":   round(wk_cur,   1) if wk_cur   is not None else None,
+        "wk_prev":  round(wk_prev,  1) if wk_prev  is not None else None,
+        "day_cur":  round(day_cur,  1) if day_cur  is not None else None,
+        "day_prev": round(day_prev, 1) if day_prev is not None else None,
+        "l1_ok": l1_ok, "l2_ok": l2_ok,
+        "l3_ok": l3_ok, "l3_n2p": l3_n2p, "l3_pos": l3_pos,
+    }
+    result = {
+        "final_val": round(final_val, 2),
+        "total_ret": total_ret,
+        "bah_ret":   bah_ret,
+        "bah_final": bah_final,
+        "max_dd":    round(max_dd, 1),
+        "trades":    trades,
+        "equity":    equity,
+        "dates":     dates_d,
+        "closes":    day_closes,
+    }
+    return signals, result, None, None
+
 
 def moving_average_bands(closes, window):
     """
@@ -390,97 +770,649 @@ def simulate_trading(signals, logic, capital, min_duration=1):
         "equity":      equity_curve,
     }
 
-def simulate_slope_flatten_strategy(closes, dates, window, annualize=252, capital=100000, slope_threshold=0):
+def moving_average_bands(closes, window):
     """
-    新策略：
-    - 斜率為負期間，若今日斜率絕對值 < 昨日斜率絕對值（跌勢趨緩）
-      → 用「剩餘現金的50%」分批買入
-    - 負轉正時，且當日斜率絕對值 >= slope_threshold → 用剩餘現金全部買入（ALL IN）
-    - 正轉負時，且當日斜率絕對值 >= slope_threshold → 全部賣出（清空持倉）
-    - slope_threshold=0 表示不過濾（原始行為）
-    回傳：每筆交易明細、最終資產、與買入持有對比
+    均線五線譜：中線（簡單移動平均）± 1標準差 ± 2標準差
+    回傳 dict，每個 key 對應一條線（長度與 closes 相同，前面不足視窗的部分為 None）
+    """
+    n = len(closes)
+    ma     = [None] * n
+    upper1 = [None] * n
+    lower1 = [None] * n
+    upper2 = [None] * n
+    lower2 = [None] * n
+    for i in range(window-1, n):
+        sub = closes[i-window+1:i+1]
+        m = sum(sub) / window
+        var = sum((v-m)**2 for v in sub) / window
+        sd = math.sqrt(var)
+        ma[i]     = m
+        upper1[i] = m + sd
+        lower1[i] = m - sd
+        upper2[i] = m + 2*sd
+        lower2[i] = m - 2*sd
+    return {"ma":ma, "upper1":upper1, "lower1":lower1, "upper2":upper2, "lower2":lower2}
+
+def backtest_direction(closes, dates, window, annualize=252, opens=None):
+    """
+    驗證斜率方向是否預測正確：
+    - 斜率由負轉正 → 用隔天開盤價買入，統計到下一次轉負（隔天開盤賣出）
+    - 斜率由正轉負 → 用隔天開盤價賣出，統計到下一次轉正（隔天開盤買入）
+    若 opens 為 None 則退回用收盤價
     """
     slopes = rolling_annualized_log_slope(closes, window, annualize)
     N = len(closes)
+    signals = []
 
-    cash = float(capital)
-    shares = 0.0
-    trades = []  # 每筆買入/賣出記錄
-    equity_curve = []
-    first_trade_date = None
-    first_trade_price = None
-    last_price = None
-
-    for i in range(1, N):
+    i = 1
+    while i < N:
         prev, cur = slopes[i-1], slopes[i]
         if math.isnan(prev) or math.isnan(cur):
+            i += 1
             continue
 
-        price = closes[i]
-        date  = dates[i]
-        last_price = price
-        if first_trade_date is None:
-            first_trade_date, first_trade_price = date, price
-
-        # 偵測正轉負：斜率強度夠才全部賣出，否則維持持倉
-        if prev > 0 and cur < 0:
-            if abs(cur) >= slope_threshold and shares > 0:
-                proceeds = shares * price
-                cash += proceeds
-                trades.append({"action":"賣出","date":date,"price":price,
-                                "amount":round(proceeds,2),"shares":round(shares,4),
-                                "cash_after":round(cash,2)})
-                shares = 0.0
-            equity_curve.append({"date":date,"val":cash + shares*price})
-            continue
-
-        # 偵測負轉正：斜率強度夠才 ALL IN，否則維持空手
         if prev < 0 and cur > 0:
-            if abs(cur) >= slope_threshold and cash > 0.01:
-                bought_shares = cash / price
-                shares += bought_shares
-                buy_amount = cash
-                cash = 0.0
-                trades.append({"action":"買入(ALL IN)","date":date,"price":price,
-                                "amount":round(buy_amount,2),"shares":round(bought_shares,4),
-                                "cash_after":round(cash,2)})
-            equity_curve.append({"date":date,"val":cash + shares*price})
+            sig_type = "負轉正"
+        elif prev > 0 and cur < 0:
+            sig_type = "正轉負"
+        else:
+            i += 1
             continue
 
-        # 跌勢趨緩：負斜率，且今日絕對值 < 昨日絕對值
-        if cur < 0 and prev < 0 and abs(cur) < abs(prev):
-            buy_amount = cash * 0.50
-            if buy_amount > 0.01:
-                bought_shares = buy_amount / price
-                shares += bought_shares
-                cash -= buy_amount
-                trades.append({"action":"買入(50%)","date":date,"price":price,
-                                "amount":round(buy_amount,2),"shares":round(bought_shares,4),
-                                "cash_after":round(cash,2)})
-        equity_curve.append({"date":date,"val":cash + shares*price})
+        # 進場：隔天開盤價（i+1）；若沒有隔天則用當天收盤
+        entry_idx = i
+        signal_date = dates[i]
+        if opens is not None and i + 1 < N:
+            entry_price = opens[i + 1]
+            entry_date  = dates[i + 1]
+        else:
+            entry_price = closes[i]
+            entry_date  = dates[i]
 
-    final_val = cash + shares * last_price if last_price else cash
-    total_ret = round((final_val - capital) / capital * 100, 2)
+        # 找下一個反轉點（或到資料末尾）
+        j = i + 1
+        while j < N:
+            s_cur  = slopes[j]
+            s_prev = slopes[j-1]
+            if math.isnan(s_cur) or math.isnan(s_prev):
+                j += 1
+                continue
+            if sig_type == "負轉正" and s_prev > 0 and s_cur < 0:
+                break  # 找到下一個轉負
+            if sig_type == "正轉負" and s_prev < 0 and s_cur > 0:
+                break  # 找到下一個轉正
+            j += 1
 
-    bah_ret = None
-    if first_trade_price and last_price:
-        bah_ret = round((last_price - first_trade_price) / first_trade_price * 100, 2)
-    bah_final = round(capital * (1 + (bah_ret or 0)/100), 0)
+        # 出場：反轉那天的隔天開盤（j+1）；若沒有則用收盤
+        raw_exit_idx = min(j, N - 1)
+        if opens is not None and raw_exit_idx + 1 < N:
+            exit_price = opens[raw_exit_idx + 1]
+            exit_date  = dates[raw_exit_idx + 1]
+            exit_idx   = raw_exit_idx + 1
+        else:
+            exit_price = closes[raw_exit_idx]
+            exit_date  = dates[raw_exit_idx]
+            exit_idx   = raw_exit_idx
+        duration   = exit_idx - entry_idx
+        price_chg  = round((exit_price - entry_price) / entry_price * 100, 2)
 
-    buy_trades  = [t for t in trades if t["action"].startswith("買入")]
-    sell_trades = [t for t in trades if t["action"]=="賣出"]
+        # 出場當日斜率（轉折那天）
+        exit_slope      = round(slopes[exit_idx], 1) if exit_idx < N and not math.isnan(slopes[exit_idx]) else 0.0
+        exit_prev_slope = round(slopes[exit_idx-1], 1) if exit_idx > 0 and not math.isnan(slopes[exit_idx-1]) else 0.0
+
+        # 判斷預測是否正確（原方法：持有到下次反轉，股價方向）
+        if sig_type == "負轉正":
+            correct = price_chg > 0
+        else:
+            correct = price_chg < 0
+
+        # 新判斷方法：訊號當天收盤價 vs T+1、T+2 收盤價平均
+        # 負轉正：當天價格 < T+1,T+2平均 → 正確（之後漲）
+        # 正轉負：當天價格 > T+1,T+2平均 → 正確（之後跌）
+        correct_t2 = None
+        if i + 2 < N:
+            avg_t1t2 = (closes[i+1] + closes[i+2]) / 2
+            if sig_type == "負轉正":
+                correct_t2 = closes[i] < avg_t1t2
+            else:
+                correct_t2 = closes[i] > avg_t1t2
+
+        signals.append({
+            "type":             sig_type,
+            "entry_date":       entry_date,
+            "exit_date":        exit_date,
+            "entry_price":      entry_price,
+            "exit_price":       exit_price,
+            "duration":         duration,
+            "price_chg":        price_chg,
+            "correct":          correct,
+            "correct_t2":       correct_t2,
+            "prev_slope":       round(prev, 1),
+            "cur_slope":        round(cur, 1),
+            "exit_prev_slope":  exit_prev_slope,
+            "exit_slope":       exit_slope,
+        })
+        i = j  # 跳到下一段
+
+    # 彙總統計
+    neg2pos = [s for s in signals if s["type"] == "負轉正"]
+    pos2neg = [s for s in signals if s["type"] == "正轉負"]
+
+    def stats(lst):
+        if not lst: return {"count":0,"correct_rate":0,"avg_chg":0,"avg_days":0,"correct_rate_t2":0,"count_t2":0}
+        correct = sum(1 for s in lst if s["correct"])
+        lst_t2 = [s for s in lst if s.get("correct_t2") is not None]
+        correct_t2 = sum(1 for s in lst_t2 if s["correct_t2"])
+        return {
+            "count":           len(lst),
+            "correct_rate":    round(correct / len(lst) * 100),
+            "avg_chg":         round(sum(s["price_chg"] for s in lst) / len(lst), 2),
+            "avg_days":        round(sum(s["duration"]  for s in lst) / len(lst), 1),
+            "correct_rate_t2": round(correct_t2 / len(lst_t2) * 100) if lst_t2 else 0,
+            "count_t2":        len(lst_t2),
+        }
 
     return {
-        "final_val":  round(final_val, 2),
-        "total_ret":  total_ret,
-        "cash_left":  round(cash, 2),
-        "shares_left": round(shares, 4),
-        "buy_count":  len(buy_trades),
-        "sell_count": len(sell_trades),
-        "trades":     trades,
-        "bah_ret":    bah_ret,
-        "bah_final":  bah_final,
-        "equity":     equity_curve,
+        "signals":  signals,
+        "neg2pos":  stats(neg2pos),
+        "pos2neg":  stats(pos2neg),
+        "total":    stats(signals),
+    }
+
+def backtest_all_windows(closes, dates, annualize=252, opens=None):
+    """對 2~20 視窗都跑方向回測"""
+    results = {}
+    for win in range(2, 21):
+        results[win] = backtest_direction(closes, dates, win, annualize, opens)
+    return results
+
+def simulate_trading(signals, logic, capital, min_duration=1):
+    cash = float(capital)
+    trades = []
+    equity_curve = []
+    peak = cash
+    max_dd = 0.0
+    idle_days = 0
+    prev_exit_date = signals[0]["entry_date"] if signals else None
+
+    for sig in signals:
+        dur = sig["duration"]
+        if dur < min_duration:
+            continue
+
+        sig_type   = sig["type"]
+        is_n2p     = "負轉正" in sig_type
+        is_p2n     = "正轉負" in sig_type
+
+        try:
+            gap = (datetime.datetime.strptime(sig["entry_date"], "%Y-%m-%d") -
+                   datetime.datetime.strptime(prev_exit_date, "%Y-%m-%d")).days
+            idle_days += max(0, gap)
+        except: pass
+
+        chg = sig["price_chg"] / 100.0
+
+        if logic == "long":
+            if is_n2p:
+                ret = chg
+            else:
+                equity_curve.append({"date": sig["entry_date"], "val": cash})
+                equity_curve.append({"date": sig["exit_date"],  "val": cash})
+                prev_exit_date = sig["exit_date"]
+                continue
+        else:
+            ret = chg if is_n2p else -chg
+
+        prev_cash = cash
+        cash = cash * (1 + ret)
+        peak = max(peak, cash)
+        dd = (peak - cash) / peak * 100
+        max_dd = max(max_dd, dd)
+        trades.append({"date": sig["entry_date"], "ret": ret * 100, "win": ret > 0})
+        equity_curve.append({"date": sig["entry_date"], "val": prev_cash})
+        equity_curve.append({"date": sig["exit_date"],  "val": cash})
+        prev_exit_date = sig["exit_date"]
+
+    wins = sum(1 for t in trades if t["win"])
+    wr = round(wins / len(trades) * 100) if trades else 0
+    return {
+        "final_val":   round(cash, 2),
+        "total_ret":   round((cash - capital) / capital * 100, 2),
+        "trade_count": len(trades),
+        "win_rate":    wr,
+        "max_dd":      round(max_dd, 1),
+        "idle_days":   idle_days,
+        "equity":      equity_curve,
+    }
+
+def moving_average_bands(closes, window):
+    """
+    均線五線譜：中線（簡單移動平均）± 1標準差 ± 2標準差
+    回傳 dict，每個 key 對應一條線（長度與 closes 相同，前面不足視窗的部分為 None）
+    """
+    n = len(closes)
+    ma     = [None] * n
+    upper1 = [None] * n
+    lower1 = [None] * n
+    upper2 = [None] * n
+    lower2 = [None] * n
+    for i in range(window-1, n):
+        sub = closes[i-window+1:i+1]
+        m = sum(sub) / window
+        var = sum((v-m)**2 for v in sub) / window
+        sd = math.sqrt(var)
+        ma[i]     = m
+        upper1[i] = m + sd
+        lower1[i] = m - sd
+        upper2[i] = m + 2*sd
+        lower2[i] = m - 2*sd
+    return {"ma":ma, "upper1":upper1, "lower1":lower1, "upper2":upper2, "lower2":lower2}
+
+def backtest_direction(closes, dates, window, annualize=252, opens=None):
+    """
+    驗證斜率方向是否預測正確：
+    - 斜率由負轉正 → 用隔天開盤價買入，統計到下一次轉負（隔天開盤賣出）
+    - 斜率由正轉負 → 用隔天開盤價賣出，統計到下一次轉正（隔天開盤買入）
+    若 opens 為 None 則退回用收盤價
+    """
+    slopes = rolling_annualized_log_slope(closes, window, annualize)
+    N = len(closes)
+    signals = []
+
+    i = 1
+    while i < N:
+        prev, cur = slopes[i-1], slopes[i]
+        if math.isnan(prev) or math.isnan(cur):
+            i += 1
+            continue
+
+        if prev < 0 and cur > 0:
+            sig_type = "負轉正"
+        elif prev > 0 and cur < 0:
+            sig_type = "正轉負"
+        else:
+            i += 1
+            continue
+
+        # 進場：隔天開盤價（i+1）；若沒有隔天則用當天收盤
+        entry_idx = i
+        signal_date = dates[i]
+        if opens is not None and i + 1 < N:
+            entry_price = opens[i + 1]
+            entry_date  = dates[i + 1]
+        else:
+            entry_price = closes[i]
+            entry_date  = dates[i]
+
+        # 找下一個反轉點（或到資料末尾）
+        j = i + 1
+        while j < N:
+            s_cur  = slopes[j]
+            s_prev = slopes[j-1]
+            if math.isnan(s_cur) or math.isnan(s_prev):
+                j += 1
+                continue
+            if sig_type == "負轉正" and s_prev > 0 and s_cur < 0:
+                break  # 找到下一個轉負
+            if sig_type == "正轉負" and s_prev < 0 and s_cur > 0:
+                break  # 找到下一個轉正
+            j += 1
+
+        # 出場：反轉那天的隔天開盤（j+1）；若沒有則用收盤
+        raw_exit_idx = min(j, N - 1)
+        if opens is not None and raw_exit_idx + 1 < N:
+            exit_price = opens[raw_exit_idx + 1]
+            exit_date  = dates[raw_exit_idx + 1]
+            exit_idx   = raw_exit_idx + 1
+        else:
+            exit_price = closes[raw_exit_idx]
+            exit_date  = dates[raw_exit_idx]
+            exit_idx   = raw_exit_idx
+        duration   = exit_idx - entry_idx
+        price_chg  = round((exit_price - entry_price) / entry_price * 100, 2)
+
+        # 出場當日斜率（轉折那天）
+        exit_slope      = round(slopes[exit_idx], 1) if exit_idx < N and not math.isnan(slopes[exit_idx]) else 0.0
+        exit_prev_slope = round(slopes[exit_idx-1], 1) if exit_idx > 0 and not math.isnan(slopes[exit_idx-1]) else 0.0
+
+        # 判斷預測是否正確（原方法：持有到下次反轉，股價方向）
+        if sig_type == "負轉正":
+            correct = price_chg > 0
+        else:
+            correct = price_chg < 0
+
+        # 新判斷方法：訊號當天收盤價 vs T+1、T+2 收盤價平均
+        # 負轉正：當天價格 < T+1,T+2平均 → 正確（之後漲）
+        # 正轉負：當天價格 > T+1,T+2平均 → 正確（之後跌）
+        correct_t2 = None
+        if i + 2 < N:
+            avg_t1t2 = (closes[i+1] + closes[i+2]) / 2
+            if sig_type == "負轉正":
+                correct_t2 = closes[i] < avg_t1t2
+            else:
+                correct_t2 = closes[i] > avg_t1t2
+
+        signals.append({
+            "type":             sig_type,
+            "entry_date":       entry_date,
+            "exit_date":        exit_date,
+            "entry_price":      entry_price,
+            "exit_price":       exit_price,
+            "duration":         duration,
+            "price_chg":        price_chg,
+            "correct":          correct,
+            "correct_t2":       correct_t2,
+            "prev_slope":       round(prev, 1),
+            "cur_slope":        round(cur, 1),
+            "exit_prev_slope":  exit_prev_slope,
+            "exit_slope":       exit_slope,
+        })
+        i = j  # 跳到下一段
+
+    # 彙總統計
+    neg2pos = [s for s in signals if s["type"] == "負轉正"]
+    pos2neg = [s for s in signals if s["type"] == "正轉負"]
+
+    def stats(lst):
+        if not lst: return {"count":0,"correct_rate":0,"avg_chg":0,"avg_days":0,"correct_rate_t2":0,"count_t2":0}
+        correct = sum(1 for s in lst if s["correct"])
+        lst_t2 = [s for s in lst if s.get("correct_t2") is not None]
+        correct_t2 = sum(1 for s in lst_t2 if s["correct_t2"])
+        return {
+            "count":           len(lst),
+            "correct_rate":    round(correct / len(lst) * 100),
+            "avg_chg":         round(sum(s["price_chg"] for s in lst) / len(lst), 2),
+            "avg_days":        round(sum(s["duration"]  for s in lst) / len(lst), 1),
+            "correct_rate_t2": round(correct_t2 / len(lst_t2) * 100) if lst_t2 else 0,
+            "count_t2":        len(lst_t2),
+        }
+
+    return {
+        "signals":  signals,
+        "neg2pos":  stats(neg2pos),
+        "pos2neg":  stats(pos2neg),
+        "total":    stats(signals),
+    }
+
+def backtest_all_windows(closes, dates, annualize=252, opens=None):
+    """對 2~20 視窗都跑方向回測"""
+    results = {}
+    for win in range(2, 21):
+        results[win] = backtest_direction(closes, dates, win, annualize, opens)
+    return results
+
+def simulate_trading(signals, logic, capital, min_duration=1):
+    cash = float(capital)
+    trades = []
+    equity_curve = []
+    peak = cash
+    max_dd = 0.0
+    idle_days = 0
+    prev_exit_date = signals[0]["entry_date"] if signals else None
+
+    for sig in signals:
+        dur = sig["duration"]
+        if dur < min_duration:
+            continue
+
+        sig_type   = sig["type"]
+        is_n2p     = "負轉正" in sig_type
+        is_p2n     = "正轉負" in sig_type
+
+        try:
+            gap = (datetime.datetime.strptime(sig["entry_date"], "%Y-%m-%d") -
+                   datetime.datetime.strptime(prev_exit_date, "%Y-%m-%d")).days
+            idle_days += max(0, gap)
+        except: pass
+
+        chg = sig["price_chg"] / 100.0
+
+        if logic == "long":
+            if is_n2p:
+                ret = chg
+            else:
+                equity_curve.append({"date": sig["entry_date"], "val": cash})
+                equity_curve.append({"date": sig["exit_date"],  "val": cash})
+                prev_exit_date = sig["exit_date"]
+                continue
+        else:
+            ret = chg if is_n2p else -chg
+
+        prev_cash = cash
+        cash = cash * (1 + ret)
+        peak = max(peak, cash)
+        dd = (peak - cash) / peak * 100
+        max_dd = max(max_dd, dd)
+        trades.append({"date": sig["entry_date"], "ret": ret * 100, "win": ret > 0})
+        equity_curve.append({"date": sig["entry_date"], "val": prev_cash})
+        equity_curve.append({"date": sig["exit_date"],  "val": cash})
+        prev_exit_date = sig["exit_date"]
+
+    wins = sum(1 for t in trades if t["win"])
+    wr = round(wins / len(trades) * 100) if trades else 0
+    return {
+        "final_val":   round(cash, 2),
+        "total_ret":   round((cash - capital) / capital * 100, 2),
+        "trade_count": len(trades),
+        "win_rate":    wr,
+        "max_dd":      round(max_dd, 1),
+        "idle_days":   idle_days,
+        "equity":      equity_curve,
+    }
+
+def moving_average_bands(closes, window):
+    """
+    均線五線譜：中線（簡單移動平均）± 1標準差 ± 2標準差
+    回傳 dict，每個 key 對應一條線（長度與 closes 相同，前面不足視窗的部分為 None）
+    """
+    n = len(closes)
+    ma     = [None] * n
+    upper1 = [None] * n
+    lower1 = [None] * n
+    upper2 = [None] * n
+    lower2 = [None] * n
+    for i in range(window-1, n):
+        sub = closes[i-window+1:i+1]
+        m = sum(sub) / window
+        var = sum((v-m)**2 for v in sub) / window
+        sd = math.sqrt(var)
+        ma[i]     = m
+        upper1[i] = m + sd
+        lower1[i] = m - sd
+        upper2[i] = m + 2*sd
+        lower2[i] = m - 2*sd
+    return {"ma":ma, "upper1":upper1, "lower1":lower1, "upper2":upper2, "lower2":lower2}
+
+def backtest_direction(closes, dates, window, annualize=252, opens=None):
+    """
+    驗證斜率方向是否預測正確：
+    - 斜率由負轉正 → 用隔天開盤價買入，統計到下一次轉負（隔天開盤賣出）
+    - 斜率由正轉負 → 用隔天開盤價賣出，統計到下一次轉正（隔天開盤買入）
+    若 opens 為 None 則退回用收盤價
+    """
+    slopes = rolling_annualized_log_slope(closes, window, annualize)
+    N = len(closes)
+    signals = []
+
+    i = 1
+    while i < N:
+        prev, cur = slopes[i-1], slopes[i]
+        if math.isnan(prev) or math.isnan(cur):
+            i += 1
+            continue
+
+        if prev < 0 and cur > 0:
+            sig_type = "負轉正"
+        elif prev > 0 and cur < 0:
+            sig_type = "正轉負"
+        else:
+            i += 1
+            continue
+
+        # 進場：隔天開盤價（i+1）；若沒有隔天則用當天收盤
+        entry_idx = i
+        signal_date = dates[i]
+        if opens is not None and i + 1 < N:
+            entry_price = opens[i + 1]
+            entry_date  = dates[i + 1]
+        else:
+            entry_price = closes[i]
+            entry_date  = dates[i]
+
+        # 找下一個反轉點（或到資料末尾）
+        j = i + 1
+        while j < N:
+            s_cur  = slopes[j]
+            s_prev = slopes[j-1]
+            if math.isnan(s_cur) or math.isnan(s_prev):
+                j += 1
+                continue
+            if sig_type == "負轉正" and s_prev > 0 and s_cur < 0:
+                break  # 找到下一個轉負
+            if sig_type == "正轉負" and s_prev < 0 and s_cur > 0:
+                break  # 找到下一個轉正
+            j += 1
+
+        # 出場：反轉那天的隔天開盤（j+1）；若沒有則用收盤
+        raw_exit_idx = min(j, N - 1)
+        if opens is not None and raw_exit_idx + 1 < N:
+            exit_price = opens[raw_exit_idx + 1]
+            exit_date  = dates[raw_exit_idx + 1]
+            exit_idx   = raw_exit_idx + 1
+        else:
+            exit_price = closes[raw_exit_idx]
+            exit_date  = dates[raw_exit_idx]
+            exit_idx   = raw_exit_idx
+        duration   = exit_idx - entry_idx
+        price_chg  = round((exit_price - entry_price) / entry_price * 100, 2)
+
+        # 出場當日斜率（轉折那天）
+        exit_slope      = round(slopes[exit_idx], 1) if exit_idx < N and not math.isnan(slopes[exit_idx]) else 0.0
+        exit_prev_slope = round(slopes[exit_idx-1], 1) if exit_idx > 0 and not math.isnan(slopes[exit_idx-1]) else 0.0
+
+        # 判斷預測是否正確（原方法：持有到下次反轉，股價方向）
+        if sig_type == "負轉正":
+            correct = price_chg > 0
+        else:
+            correct = price_chg < 0
+
+        # 新判斷方法：訊號當天收盤價 vs T+1、T+2 收盤價平均
+        # 負轉正：當天價格 < T+1,T+2平均 → 正確（之後漲）
+        # 正轉負：當天價格 > T+1,T+2平均 → 正確（之後跌）
+        correct_t2 = None
+        if i + 2 < N:
+            avg_t1t2 = (closes[i+1] + closes[i+2]) / 2
+            if sig_type == "負轉正":
+                correct_t2 = closes[i] < avg_t1t2
+            else:
+                correct_t2 = closes[i] > avg_t1t2
+
+        signals.append({
+            "type":             sig_type,
+            "entry_date":       entry_date,
+            "exit_date":        exit_date,
+            "entry_price":      entry_price,
+            "exit_price":       exit_price,
+            "duration":         duration,
+            "price_chg":        price_chg,
+            "correct":          correct,
+            "correct_t2":       correct_t2,
+            "prev_slope":       round(prev, 1),
+            "cur_slope":        round(cur, 1),
+            "exit_prev_slope":  exit_prev_slope,
+            "exit_slope":       exit_slope,
+        })
+        i = j  # 跳到下一段
+
+    # 彙總統計
+    neg2pos = [s for s in signals if s["type"] == "負轉正"]
+    pos2neg = [s for s in signals if s["type"] == "正轉負"]
+
+    def stats(lst):
+        if not lst: return {"count":0,"correct_rate":0,"avg_chg":0,"avg_days":0,"correct_rate_t2":0,"count_t2":0}
+        correct = sum(1 for s in lst if s["correct"])
+        lst_t2 = [s for s in lst if s.get("correct_t2") is not None]
+        correct_t2 = sum(1 for s in lst_t2 if s["correct_t2"])
+        return {
+            "count":           len(lst),
+            "correct_rate":    round(correct / len(lst) * 100),
+            "avg_chg":         round(sum(s["price_chg"] for s in lst) / len(lst), 2),
+            "avg_days":        round(sum(s["duration"]  for s in lst) / len(lst), 1),
+            "correct_rate_t2": round(correct_t2 / len(lst_t2) * 100) if lst_t2 else 0,
+            "count_t2":        len(lst_t2),
+        }
+
+    return {
+        "signals":  signals,
+        "neg2pos":  stats(neg2pos),
+        "pos2neg":  stats(pos2neg),
+        "total":    stats(signals),
+    }
+
+def backtest_all_windows(closes, dates, annualize=252, opens=None):
+    """對 2~20 視窗都跑方向回測"""
+    results = {}
+    for win in range(2, 21):
+        results[win] = backtest_direction(closes, dates, win, annualize, opens)
+    return results
+
+def simulate_trading(signals, logic, capital, min_duration=1):
+    cash = float(capital)
+    trades = []
+    equity_curve = []
+    peak = cash
+    max_dd = 0.0
+    idle_days = 0
+    prev_exit_date = signals[0]["entry_date"] if signals else None
+
+    for sig in signals:
+        dur = sig["duration"]
+        if dur < min_duration:
+            continue
+
+        sig_type   = sig["type"]
+        is_n2p     = "負轉正" in sig_type
+        is_p2n     = "正轉負" in sig_type
+
+        try:
+            gap = (datetime.datetime.strptime(sig["entry_date"], "%Y-%m-%d") -
+                   datetime.datetime.strptime(prev_exit_date, "%Y-%m-%d")).days
+            idle_days += max(0, gap)
+        except: pass
+
+        chg = sig["price_chg"] / 100.0
+
+        if logic == "long":
+            if is_n2p:
+                ret = chg
+            else:
+                equity_curve.append({"date": sig["entry_date"], "val": cash})
+                equity_curve.append({"date": sig["exit_date"],  "val": cash})
+                prev_exit_date = sig["exit_date"]
+                continue
+        else:
+            ret = chg if is_n2p else -chg
+
+        prev_cash = cash
+        cash = cash * (1 + ret)
+        peak = max(peak, cash)
+        dd = (peak - cash) / peak * 100
+        max_dd = max(max_dd, dd)
+        trades.append({"date": sig["entry_date"], "ret": ret * 100, "win": ret > 0})
+        equity_curve.append({"date": sig["entry_date"], "val": prev_cash})
+        equity_curve.append({"date": sig["exit_date"],  "val": cash})
+        prev_exit_date = sig["exit_date"]
+
+    wins = sum(1 for t in trades if t["win"])
+    wr = round(wins / len(trades) * 100) if trades else 0
+    return {
+        "final_val":   round(cash, 2),
+        "total_ret":   round((cash - capital) / capital * 100, 2),
+        "trade_count": len(trades),
+        "win_rate":    wr,
+        "max_dd":      round(max_dd, 1),
+        "idle_days":   idle_days,
+        "equity":      equity_curve,
     }
 
 def check_slope_alerts(window=5):
@@ -506,48 +1438,38 @@ def check_slope_alerts(window=5):
         print(f"[{datetime.datetime.now()}] 無斜率轉正信號")
 
 def scheduler_loop():
-    """
-    排程邏輯：
-    - 台灣時間 20:00 到隔天 06:00 期間，每 2 小時發送一次斜率報告
-    - 發送時間點：20:00、22:00、00:00、02:00、04:00、06:00
-    - 非發送時間段（06:00-20:00）則靜默等待
-    - 每天 22:00（UTC 14:00）另外檢查斜率轉折訊號
-    """
-    # 台灣時間對應 UTC：台灣時間 = UTC+8
-    # 20:00 台灣 = 12:00 UTC
-    # 06:00 台灣 = 22:00 UTC（前一日）
-    # 發送時間點（UTC）：12,14,16,18,20,22
-    SEND_HOURS_UTC = [(h - 8) % 24 for h in SCHEDULE_HOURS_TW]
-
+    """每次迴圈重新讀取 SCHEDULE_HOURS_TW，支援動態更改發送時間。"""
     while True:
-        now_utc = datetime.datetime.now(tz=timezone.utc)
-        now_tw_hour = (now_utc.hour + 8) % 24  # 台灣時間小時
+        send_hours_utc = sorted([(h - 8) % 24 for h in SCHEDULE_HOURS_TW])
 
-        # 找下一個發送時間點（UTC）
-        current_hour = now_utc.hour
+        now_utc = datetime.datetime.now(tz=timezone.utc)
+
         next_send = None
-        for h in SEND_HOURS_UTC:
+        for h in send_hours_utc:
             cand = now_utc.replace(hour=h, minute=0, second=0, microsecond=0)
             if cand > now_utc:
                 next_send = cand
                 break
         if next_send is None:
-            # 今日最後一個已過，等明天第一個
             next_send = (now_utc + datetime.timedelta(days=1)).replace(
-                hour=SEND_HOURS_UTC[0], minute=0, second=0, microsecond=0)
+                hour=send_hours_utc[0], minute=0, second=0, microsecond=0)
 
         wait_sec = (next_send - now_utc).total_seconds()
-        tw_next = (next_send + datetime.timedelta(hours=8)).strftime("%H:%M")
-        print(f"[排程] 下次發送：台灣時間 {tw_next}，等待 {wait_sec/3600:.1f} 小時")
+        tw_next  = (next_send + datetime.timedelta(hours=8)).strftime("%H:%M")
+        tw_hours = " / ".join([f"{(h+8)%24:02d}:00" for h in send_hours_utc])
+        print(f"[排程] 發送時間：{tw_hours}（台灣）　下次：{tw_next}　等待 {wait_sec/3600:.1f}h")
         threading.Event().wait(wait_sec)
 
-        # 發送斜率報告
-        send_current_slope_auto()
+        try:
+            send_current_slope_auto()
+        except Exception as e:
+            print(f"[排程] 發送失敗：{e}")
 
-        # 22:00 UTC（台灣 06:00）額外檢查斜率轉折
-        if next_send.hour == 14:
+        try:
             check_slope_alerts()
             check_asia_signal()
+        except Exception as e:
+            print(f"[排程] 檢查失敗：{e}")
 
 def slope_block(ticker, closes, window):
     """單一股票斜率分析，回傳 LINE 訊息 block"""
@@ -603,64 +1525,140 @@ def asia_slope_block(display, closes, window):
     extra = f"　{ret5_str}　｜　{nh_str}"
     return base + "\n" + extra
 
+def build_option_line_msg(ticker):
+    """產生期權結構的 LINE 訊息文字"""
+    try:
+        import yfinance as yf
+        import math as _math
+        t    = yf.Ticker(ticker)
+        spot = t.fast_info.last_price
+        exps = t.options
+        if not exps: return None
+        today     = datetime.date.today()
+        exp_data  = []
+        all_puts  = {}
+        all_calls = {}
+        for e in exps[:2]:
+            ed   = datetime.date.fromisoformat(e)
+            days = (ed - today).days
+            try:
+                chain = t.option_chain(e)
+                puts  = chain.puts[["strike","openInterest"]].dropna()
+                calls = chain.calls[["strike","openInterest"]].dropna()
+                for _, row in puts.iterrows():
+                    all_puts[row["strike"]]  = all_puts.get(row["strike"],0)  + row["openInterest"]
+                for _, row in calls.iterrows():
+                    all_calls[row["strike"]] = all_calls.get(row["strike"],0) + row["openInterest"]
+                exp_data.append({
+                    "exp": e, "days": days,
+                    "is_gamma": ed.weekday() in [2,4],
+                    "is_opex":  ed.weekday() == 4,
+                    "top_puts":  puts.nlargest(3,"openInterest")[["strike","openInterest"]].values.tolist(),
+                    "top_calls": calls.nlargest(3,"openInterest")[["strike","openInterest"]].values.tolist(),
+                })
+            except: continue
+
+        top_put_strikes  = sorted(all_puts,  key=lambda k: all_puts[k],  reverse=True)[:3]
+        top_call_strikes = sorted(all_calls, key=lambda k: all_calls[k], reverse=True)[:3]
+        support  = [(k, all_puts[k])  for k in top_put_strikes  if k < spot]
+        resist   = [(k, all_calls[k]) for k in top_call_strikes if k > spot]
+
+        main_sup = support[0] if support else None
+        main_res = resist[0]  if resist  else None
+
+        tw_time = datetime.datetime.now(
+            datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+
+        # 建議
+        sug = ""
+        if main_sup and main_res:
+            d_sup = (spot - main_sup[0]) / spot * 100
+            d_res = (main_res[0] - spot) / spot * 100
+            if d_sup <= 2:
+                sug = f"🟢 接近支撐 ${main_sup[0]:.0f}（差 {d_sup:.1f}%），可考慮買入"
+            elif d_res <= 2:
+                sug = f"🔴 接近阻力 ${main_res[0]:.0f}（差 {d_res:.1f}%），可考慮減倉"
+            else:
+                sug = f"⚪ 區間中段　支撐 ${main_sup[0]:.0f}（-{d_sup:.1f}%）　阻力 ${main_res[0]:.0f}（+{d_res:.1f}%）"
+
+        # 歷史追蹤
+        put_note, call_note = track_option_wall(
+            ticker, main_sup[0] if main_sup else 0, main_res[0] if main_res else 0)
+
+        # 跨月雙重確認
+        def dual(strike, side):
+            key = "top_puts" if side=="put" else "top_calls"
+            return sum(1 for ed in exp_data if strike in [r[0] for r in ed[key]]) >= 2
+
+        dual_puts  = [(k,v) for k,v in [(k,all_puts[k])  for k in top_put_strikes  if k<spot]  if dual(k,"put")]
+        dual_calls = [(k,v) for k,v in [(k,all_calls[k]) for k in top_call_strikes if k>spot] if dual(k,"call")]
+
+        put_str  = "　".join([f"${k:.0f}(✅雙月)" for k,v in dual_puts[:2]]  or [f"${k:.0f}" for k,v in support[:2]])
+        call_str = "　".join([f"${k:.0f}(✅雙月)" for k,v in dual_calls[:2]] or [f"${k:.0f}" for k,v in resist[:2]])
+
+        next_exp = exp_data[0] if exp_data else None
+        exp_line = ""
+        if next_exp:
+            tags = ("⚠️Gamma高峰" if next_exp["is_gamma"] else "") + ("　📅月結算" if next_exp["is_opex"] else "")
+            exp_line = f"\n📅 結算日 {next_exp['exp']}（{next_exp['days']}天後）{tags}"
+
+        msg = (f"【⚡ {ticker} 期權結構】\n{tw_time}\n\n"
+               f"📍 現價：${spot:.2f}\n"
+               f"{sug}\n\n"
+               f"🔗 Put牆：{put_str or '—'}\n"
+               f"🔗 Call牆：{call_str or '—'}\n")
+        if put_note:  msg += f"{put_note}\n"
+        if call_note: msg += f"{call_note}\n"
+        msg += exp_line
+        return msg
+    except Exception as e:
+        return f"【期權分析失敗】{e}"
+
+
 def send_current_slope_auto():
-    """自動排程呼叫的斜率報告（與手動按鈕版本相同邏輯）"""
+    """自動排程呼叫的斜率報告"""
     end_dt   = datetime.datetime.now(tz=timezone.utc)
     start_dt = end_dt - datetime.timedelta(days=30)
     window   = 5
     tw_time  = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-    blocks   = [f"【定時斜率報告】\n{tw_time} 台灣時間"]
-    vix_val  = None
-    try:
-        vd = fetch_vix(start_dt, end_dt)
-        if vd: vix_val = vd[sorted(vd.keys())[-1]]
-    except: pass
-    for ticker in WATCH_TICKERS:
+
+    if "slope" in SCHEDULE_CONTENT:
+        blocks = [f"【定時斜率報告】\n{tw_time} 台灣時間"]
+        blocks.append("🇺🇸 ── 美股 ──")
+        for ticker in WATCH_TICKERS:
+            try:
+                _, closes, _, _o = fetch_yahoo_range(ticker, start_dt, end_dt, "1d")
+                blocks.append(slope_block(ticker, closes, window))
+            except Exception as e:
+                blocks.append(f"⚪ {ticker}：錯誤 {e}")
+        blocks.append("🇹🇼 ── 亞洲 ──")
+        for ticker in WATCH_TICKERS_TW + WATCH_TICKERS_ASIA:
+            try:
+                _, closes, _, _o = fetch_yahoo_range(ticker, start_dt, end_dt, "1d")
+                display = TICKER_NAMES.get(ticker, ticker)
+                blocks.append(asia_slope_block(display, closes, window))
+            except Exception as e:
+                blocks.append(f"⚪ {TICKER_NAMES.get(ticker,ticker)}：錯誤 {e}")
         try:
-            _, closes, _, _o = fetch_yahoo_range(ticker, start_dt, end_dt, "1d")
-            slopes = rolling_annualized_log_slope(closes, window)
-            valid  = [s for s in slopes if not math.isnan(s)]
-            if len(valid) < 2:
-                blocks.append(f"⚪ {ticker}：資料不足"); continue
-            prev_slope, last_slope = valid[-2], valid[-1]
-            price = closes[-1]
+            vd = fetch_vix(start_dt, end_dt)
+            if vd:
+                vix_val   = vd[sorted(vd.keys())[-1]]
+                vix_emoji = "🔴" if vix_val > 30 else "🟡" if vix_val > 20 else "🟢"
+                vix_label = "高恐懼" if vix_val > 30 else "中性" if vix_val > 20 else "低恐懼"
+                blocks.append(f"────────────────\n{vix_emoji} VIX {vix_val:.1f}｜{vix_label}\n────────────────")
+        except: pass
+        send_line("\n\n".join(blocks))
+        print(f"[排程] 已發送斜率報告 {tw_time}")
 
-            # 斜率趨緩判斷（負斜率但絕對值在縮小）
-            flattening = (last_slope < 0 and prev_slope < 0 and
-                          abs(last_slope) < abs(prev_slope))
-
-            if prev_slope < 0 and last_slope > 0:
-                block = (f"╔══════════════════╗\n⚡ {ticker} 負轉正！\n"
-                         f"斜率：{prev_slope:.1f}% → +{last_slope:.1f}%\n"
-                         f"現價：${price:.2f}\n👉 可考慮買入\n╚══════════════════╝")
-            elif prev_slope > 0 and last_slope < 0:
-                block = (f"╔══════════════════╗\n🔻 {ticker} 正轉負！\n"
-                         f"斜率：+{prev_slope:.1f}% → {last_slope:.1f}%\n"
-                         f"現價：${price:.2f}\n👉 可考慮減倉\n╚══════════════════╝")
-            elif flattening:
-                block = (f"╔══════════════════╗\n📊 {ticker} 跌勢趨緩！\n"
-                         f"斜率：{prev_slope:.1f}% → {last_slope:.1f}%\n"
-                         f"（負斜率縮小，下跌動能減弱）\n"
-                         f"現價：${price:.2f}\n👉 可考慮分批布局\n╚══════════════════╝")
-            elif last_slope > 100:
-                block = f"🚀 {ticker}｜斜率 +{last_slope:.1f}%｜${price:.2f}\n強勁多頭，持有或加碼"
-            elif last_slope > 0:
-                block = f"📈 {ticker}｜斜率 +{last_slope:.1f}%｜${price:.2f}\n動能向上，持續觀察"
-            elif last_slope > -30:
-                block = f"➡️ {ticker}｜斜率 {last_slope:.1f}%｜${price:.2f}\n盤整偏弱，等待方向確認"
-            elif last_slope > -100:
-                block = f"📉 {ticker}｜斜率 {last_slope:.1f}%｜${price:.2f}\n動能走弱，建議觀望"
-            else:
-                block = f"🔴 {ticker}｜斜率 {last_slope:.1f}%｜${price:.2f}\n下跌趨勢，空手等待"
-            blocks.append(block)
+    if "option" in SCHEDULE_CONTENT:
+        try:
+            msg = build_option_line_msg(SCHEDULE_OPT_TICKER)
+            if msg:
+                send_line(msg)
+                print(f"[排程] 已發送期權報告 {tw_time}")
         except Exception as e:
-            blocks.append(f"⚪ {ticker}：錯誤 {e}")
-    if vix_val is not None:
-        vix_emoji = "🔴" if vix_val > 30 else "🟡" if vix_val > 20 else "🟢"
-        vix_label = "高恐懼" if vix_val > 30 else "中性" if vix_val > 20 else "低恐懼"
-        blocks.append(f"────────────────\n{vix_emoji} VIX {vix_val:.1f}｜{vix_label}\n────────────────")
-    send_line("\n\n".join(blocks))
-    print(f"[排程] 已發送斜率報告 {tw_time}")
+            print(f"[排程] 期權報告失敗：{e}")
+
 
 def check_asia_signal(window=20):
     """
@@ -794,6 +1792,27 @@ app.layout = html.Div([
                 style={"width":"90px","fontSize":"13px"},
             ),
         ], style={"display":"flex","alignItems":"center","gap":"6px"}),
+        html.Div([
+            html.Label("發送內容：",style={"fontSize":"12px","color":"#888","alignSelf":"center"}),
+            dcc.Checklist(
+                id="schedule-content",
+                options=[
+                    {"label":" 斜率", "value":"slope"},
+                    {"label":" 期權", "value":"option"},
+                ],
+                value=["slope"],
+                inline=True,
+                style={"fontSize":"12px"},
+                inputStyle={"marginRight":"3px","marginLeft":"8px"},
+            ),
+        ], style={"display":"flex","alignItems":"center","gap":"4px"}),
+        html.Div([
+            html.Label("期權標的：",style={"fontSize":"12px","color":"#888","alignSelf":"center"}),
+            dcc.Input(id="schedule-opt-ticker", value="QQQ",
+                      style={"width":"80px","fontSize":"12px","padding":"3px 6px",
+                             "border":"1px solid #ddd","borderRadius":"4px"}),
+        ], id="schedule-opt-ticker-div",
+           style={"display":"flex","alignItems":"center","gap":"4px"}),
         html.Button("✅ 套用",id="schedule-apply-btn",n_clicks=0,
                     style={"padding":"6px 14px","background":"#f5f5f3","border":"1px solid #ddd",
                            "borderRadius":"6px","cursor":"pointer","fontSize":"12px"}),
@@ -840,7 +1859,22 @@ app.layout = html.Div([
         color="#2563eb",
     ),
 
-    html.H3("恐懼指標",style={"fontFamily":"sans-serif","marginTop":"24px","marginBottom":"4px","fontSize":"16px"}),
+    html.H3("📊 六狀態組合分析",style={"fontFamily":"sans-serif","marginTop":"32px","marginBottom":"4px","fontSize":"16px"}),
+    html.P("L1（月線）× L2（週線）× L3（日線）六狀態組合，統計歷史上各組合進場後的平均報酬和勝率",
+           style={"fontSize":"12px","color":"#aaa","marginBottom":"8px","fontFamily":"sans-serif"}),
+    html.Div([
+        html.Label("分析股票：",style={"fontSize":"12px","color":"#888","alignSelf":"center"}),
+        dcc.Input(id="six-state-ticker", value="QQQ", type="text",
+                  style={"width":"100px","fontSize":"13px","padding":"4px 8px",
+                         "border":"1px solid #ddd","borderRadius":"6px"}),
+        html.Button("🔍 開始分析", id="six-state-btn", n_clicks=0,
+                    style={"padding":"6px 16px","background":"#1a1a1a","color":"#fff",
+                           "border":"none","borderRadius":"6px","cursor":"pointer",
+                           "fontSize":"13px","marginLeft":"8px"}),
+    ], style={"display":"flex","gap":"8px","alignItems":"center","marginBottom":"12px","flexWrap":"wrap"}),
+    html.Div(id="six-state-div"),
+
+    html.H3("恐懼指標",style={"fontFamily":"sans-serif","marginTop":"32px","marginBottom":"4px","fontSize":"16px"}),
     html.P(id="fear-status",style={"fontSize":"12px","color":"#aaa","marginBottom":"8px","fontFamily":"sans-serif"}),
     html.Div(id="fear-cards"),
     html.P("VIX >30 為高恐懼區。Fear & Greed Index：0=極度恐懼，100=極度貪婪（加密市場版）。",
@@ -864,6 +1898,21 @@ app.layout = html.Div([
                            "marginLeft":"10px"}),
     ], style={"display":"flex","alignItems":"center","marginBottom":"12px","gap":"4px"}),
     html.Div(id="asia-signal-div"),
+
+    html.H3("⚡ 期權結構分析",style={"fontFamily":"sans-serif","marginTop":"32px","marginBottom":"4px","fontSize":"16px"}),
+    html.P("Put/Call牆、Gamma Exposure、結算日分析，協助判斷支撐阻力與買賣建議",
+           style={"fontSize":"12px","color":"#aaa","marginBottom":"8px","fontFamily":"sans-serif"}),
+    html.Div([
+        html.Label("標的：",style={"fontSize":"12px","color":"#888","alignSelf":"center"}),
+        dcc.Input(id="opt-ticker", value="QQQ", type="text",
+                  style={"width":"90px","fontSize":"13px","padding":"4px 8px",
+                         "border":"1px solid #ddd","borderRadius":"6px"}),
+        html.Button("📊 分析期權結構", id="opt-btn", n_clicks=0,
+                    style={"padding":"8px 16px","background":"#7c3aed","color":"#fff",
+                           "border":"none","borderRadius":"6px","cursor":"pointer",
+                           "fontSize":"13px","marginLeft":"8px"}),
+    ], style={"display":"flex","gap":"8px","alignItems":"center","marginBottom":"12px"}),
+    html.Div(id="opt-div"),
 
     html.H3("🇹🇼 台股月K篩選",style={"fontFamily":"sans-serif","marginTop":"32px","marginBottom":"4px","fontSize":"16px"}),
     html.P("台灣中型100成分股：6月紅K且收高於上月→買入觀察；6月黑K且低於5月均價→避開",
@@ -930,19 +1979,39 @@ def update_window_label(interval):
 
 @app.callback(
     Output("schedule-msg","children"),
+    Output("schedule-opt-ticker-div","style"),
     Input("schedule-apply-btn","n_clicks"),
+    Input("schedule-content","value"),
     State("schedule-time-1","value"),
     State("schedule-time-2","value"),
+    State("schedule-content","value"),
+    State("schedule-opt-ticker","value"),
     prevent_initial_call=True,
 )
-def apply_schedule(n_clicks, t1, t2):
-    global SCHEDULE_HOURS_TW
+def apply_schedule(n_clicks, content_val, t1, t2, content, opt_ticker):
+    global SCHEDULE_HOURS_TW, SCHEDULE_CONTENT, SCHEDULE_OPT_TICKER
+    # 顯示/隱藏期權標的欄位
+    show_opt = "option" in (content_val or [])
+    opt_style = {"display":"flex","alignItems":"center","gap":"4px"} if show_opt else {"display":"none"}
+
+    from dash import ctx
+    if not n_clicks or ctx.triggered_id != "schedule-apply-btn":
+        return "", opt_style
+
     h1 = int(t1 or 20)
     h2 = int(t2 or 22)
     if h1 == h2:
-        return "❌ 兩個時間不能相同"
-    SCHEDULE_HOURS_TW = sorted([h1, h2])
-    return f"✅ 已設定：每天 {SCHEDULE_HOURS_TW[0]:02d}:00 和 {SCHEDULE_HOURS_TW[1]:02d}:00 發送"
+        return "❌ 兩個時間不能相同", opt_style
+
+    SCHEDULE_HOURS_TW   = sorted([h1, h2])
+    SCHEDULE_CONTENT    = list(content or ["slope"])
+    SCHEDULE_OPT_TICKER = (opt_ticker or "QQQ").strip().upper()
+
+    content_label = "+".join(
+        "斜率" if c=="slope" else f"期權({SCHEDULE_OPT_TICKER})"
+        for c in SCHEDULE_CONTENT)
+    return (f"✅ {SCHEDULE_HOURS_TW[0]:02d}:00 / {SCHEDULE_HOURS_TW[1]:02d}:00　"
+            f"發送：{content_label}"), opt_style
 
 @app.callback(Output("test-msg","children"), Input("test-btn","n_clicks"), prevent_initial_call=True)
 def test_line(n):
@@ -1065,150 +2134,118 @@ def update_content(n_clicks, ticker_str, window, show_volume, days, interval):
                 if k == 0: vol_colors.append("rgba(150,150,150,0.5)")
                 elif closes[k] >= closes[k-1]: vol_colors.append("rgba(34,160,107,0.5)")
                 else: vol_colors.append("rgba(226,72,61,0.5)")
-            # 計算跌勢趨緩分批進場策略（搭配相同視窗，僅每日模式）
-            show_flatten = (interval == "1d" and len(closes) > window + 2)
-            if show_flatten:
-                flatten_res = simulate_slope_flatten_strategy(closes, dates, window, annualize_factor, 100000)
-                buy50_x, buy50_y = [], []
-                buyall_x, buyall_y = [], []
-                sell_x, sell_y = [], []
-                for t in flatten_res["trades"]:
-                    if t["action"] == "買入(50%)":
-                        buy50_x.append(t["date"]); buy50_y.append(t["price"])
-                    elif t["action"] == "買入(ALL IN)":
-                        buyall_x.append(t["date"]); buyall_y.append(t["price"])
-                    elif t["action"] == "賣出":
-                        sell_x.append(t["date"]); sell_y.append(t["price"])
-                eq_dates = [p["date"] for p in flatten_res["equity"]]
-                eq_vals  = [p["val"] for p in flatten_res["equity"]]
-                bah_curve = None
-                if flatten_res.get("bah_ret") is not None and eq_dates:
-                    first_p = closes[dates.index(eq_dates[0])] if eq_dates[0] in dates else closes[0]
-                    bah_curve = []
-                    for d2 in eq_dates:
-                        idx = dates.index(d2) if d2 in dates else 0
-                        bah_curve.append(100000 * (closes[idx] / first_p))
 
-            # 建立子圖：股價+斜率 / 成交量 / 策略資產
-            if show_flatten and show_vol:
-                fig = make_subplots(rows=3,cols=1,shared_xaxes=True,row_heights=[0.5,0.2,0.3],
-                                    vertical_spacing=0.04,
-                                    specs=[[{"secondary_y":True}],[{"secondary_y":False}],[{"secondary_y":False}]],
-                                    subplot_titles=("","","資產走勢（總值＝現金＋持股市值）"))
+            # 建立主圖（月/週/日三層斜率 + 收盤價）
+            show_vol = "vol" in (show_volume or [])
+
+            if interval == "1d":
+                # 三層斜率
+                s_mo  = rolling_annualized_log_slope(closes, min(120, len(closes)-1), 252)
+                s_wk  = rolling_annualized_log_slope(closes, min(40,  len(closes)-1), 252)
+                s_day = rolling_annualized_log_slope(closes, window, annualize_factor)
+                def to_line(s):
+                    return [None if math.isnan(v) else v for v in s]
+                mo_line  = to_line(s_mo)
+                wk_line  = to_line(s_wk)
+                day_line = to_line(s_day)
+
+                n_rows = 4 if show_vol else 4
+                row_h  = [0.2, 0.2, 0.2, 0.4] if show_vol else [0.2, 0.2, 0.2, 0.4]
+                specs  = [[{"secondary_y":False}]]*3 + [[{"secondary_y": True}]]
+                titles = ("L1 月線斜率（120日）", "L2 週線斜率（40日）",
+                          f"L3 日線斜率（{window}日）", "收盤價")
+
+                fig = make_subplots(rows=4, cols=1, shared_xaxes=True,
+                                    row_heights=row_h, vertical_spacing=0.03,
+                                    specs=specs, subplot_titles=titles)
                 chart_height = 620
-                vol_row, asset_row = 2, 3
-            elif show_flatten:
-                fig = make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.6,0.4],
-                                    vertical_spacing=0.05,
-                                    specs=[[{"secondary_y":True}],[{"secondary_y":False}]],
-                                    subplot_titles=("","資產走勢（總值＝現金＋持股市值）"))
-                chart_height = 540
-                vol_row, asset_row = None, 2
-            elif show_vol:
-                fig = make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.68,0.32],
-                                    vertical_spacing=0.04,specs=[[{"secondary_y":True}],[{"secondary_y":False}]])
-                chart_height = 420
-                vol_row, asset_row = 2, None
+
+                def add_slope_bars(sl, row, up_c, dn_c):
+                    ps = [v if (v or 0)>0 else 0 for v in sl]
+                    ns = [v if (v or 0)<0 else 0 for v in sl]
+                    fig.add_trace(go.Bar(x=dates,y=ps,marker_color=up_c,showlegend=False,
+                        hovertemplate="%{x}<br>%{y:.1f}%<extra></extra>"),row=row,col=1)
+                    fig.add_trace(go.Bar(x=dates,y=ns,marker_color=dn_c,showlegend=False,
+                        hovertemplate="%{x}<br>%{y:.1f}%<extra></extra>"),row=row,col=1)
+                    fig.add_trace(go.Scatter(x=dates,y=sl,mode="lines",showlegend=False,
+                        line=dict(color="#444",width=1),
+                        hovertemplate="%{x}<br>%{y:.2f}%<extra></extra>"),row=row,col=1)
+                    fig.add_hline(y=0,line_color="#ccc",line_width=1,row=row,col=1)
+
+                add_slope_bars(mo_line,  1, "rgba(34,160,107,0.3)", "rgba(226,72,61,0.3)")
+                add_slope_bars(wk_line,  2, "rgba(34,160,107,0.35)","rgba(226,72,61,0.35)")
+                add_slope_bars(day_line, 3, "rgba(34,160,107,0.4)", "rgba(226,72,61,0.4)")
+
+                # 收盤價（第4列）
+                fig.add_trace(go.Scatter(x=dates,y=closes,name="收盤價",mode="lines",
+                    line=dict(color=color,width=2),
+                    hovertemplate="%{x}<br>收盤: $%{y:.2f}<extra></extra>"),
+                    row=4,col=1,secondary_y=False)
+
+                fig.update_layout(
+                    title=dict(text=f"<b>{ticker}</b>　三層斜率　{date_range_str}",
+                               font=dict(size=13,color="#1a1a1a"),x=0),
+                    barmode="overlay",bargap=0,hovermode="x unified",
+                    legend=dict(orientation="h",yanchor="bottom",y=1.04,xanchor="right",x=1,font=dict(size=11)),
+                    plot_bgcolor="white",paper_bgcolor="white",
+                    margin=dict(l=60,r=20,t=50,b=40),
+                    font=dict(family="sans-serif",size=11),height=chart_height)
+                fig.update_xaxes(showgrid=True,gridcolor="#eee")
+                for row in [1,2,3]:
+                    fig.update_yaxes(showgrid=True,gridcolor="#eee",zeroline=False,
+                                     title_font=dict(size=9),row=row,col=1)
+                fig.update_yaxes(title_text="收盤價",showgrid=True,gridcolor="#eee",
+                                 zeroline=False,row=4,col=1,secondary_y=False)
+
             else:
-                fig = make_subplots(rows=1,cols=1,specs=[[{"secondary_y":True}]])
-                chart_height = 300
-                vol_row, asset_row = None, None
+                # 非每日模式：只顯示單一斜率圖
+                if show_vol:
+                    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                        row_heights=[0.68,0.32], vertical_spacing=0.04,
+                                        specs=[[{"secondary_y":True}],[{"secondary_y":False}]])
+                    chart_height = 420
+                else:
+                    fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y":True}]])
+                    chart_height = 300
 
-            fig.add_trace(go.Bar(x=dates,y=pos_s,name="上升",marker_color="rgba(34,160,107,0.35)",showlegend=False,
-                hovertemplate="%{x}<br>斜率: %{y:.1f}%<extra></extra>"),row=1,col=1,secondary_y=False)
-            fig.add_trace(go.Bar(x=dates,y=neg_s,name="下跌",marker_color="rgba(226,72,61,0.35)",showlegend=False,
-                hovertemplate="%{x}<br>斜率: %{y:.1f}%<extra></extra>"),row=1,col=1,secondary_y=False)
-            fig.add_trace(go.Scatter(x=dates,y=slope_line,name=slope_label,mode="lines",
-                line=dict(color="#444",width=1.2),hovertemplate="%{x}<br>斜率: %{y:.2f}%<extra></extra>"),
-                row=1,col=1,secondary_y=False)
-            fig.add_trace(go.Scatter(x=dates,y=closes,name="收盤價",mode="lines",
-                line=dict(color=color,width=2),hovertemplate="%{x}<br>收盤: $%{y:.2f}<extra></extra>"),
-                row=1,col=1,secondary_y=True)
+                fig.add_trace(go.Bar(x=dates,y=pos_s,name="上升",marker_color="rgba(34,160,107,0.35)",showlegend=False,
+                    hovertemplate="%{x}<br>斜率: %{y:.1f}%<extra></extra>"),row=1,col=1,secondary_y=False)
+                fig.add_trace(go.Bar(x=dates,y=neg_s,name="下跌",marker_color="rgba(226,72,61,0.35)",showlegend=False,
+                    hovertemplate="%{x}<br>斜率: %{y:.1f}%<extra></extra>"),row=1,col=1,secondary_y=False)
+                fig.add_trace(go.Scatter(x=dates,y=slope_line,name=slope_label,mode="lines",
+                    line=dict(color="#444",width=1.2),hovertemplate="%{x}<br>斜率: %{y:.2f}%<extra></extra>"),
+                    row=1,col=1,secondary_y=False)
+                fig.add_trace(go.Scatter(x=dates,y=closes,name="收盤價",mode="lines",
+                    line=dict(color=color,width=2),hovertemplate="%{x}<br>收盤: $%{y:.2f}<extra></extra>"),
+                    row=1,col=1,secondary_y=True)
+                if show_vol:
+                    fig.add_trace(go.Bar(x=dates,y=volumes,name="成交量",marker_color=vol_colors,
+                        hovertemplate="%{x}<br>成交量: %{y:,.0f}<extra></extra>"),row=2,col=1)
+                fig.add_hline(y=0,line_color="#ccc",line_width=1,row=1,col=1)
+                fig.update_layout(
+                    title=dict(text=f"<b>{ticker}</b>　{slope_label}　{date_range_str}",
+                               font=dict(size=13,color="#1a1a1a"),x=0),
+                    barmode="overlay",bargap=0,hovermode="x unified",
+                    legend=dict(orientation="h",yanchor="bottom",y=1.06,xanchor="right",x=1,font=dict(size=11)),
+                    plot_bgcolor="white",paper_bgcolor="white",
+                    margin=dict(l=60,r=65,t=50,b=40),
+                    font=dict(family="sans-serif",size=12),height=chart_height)
+                fig.update_xaxes(showgrid=True,gridcolor="#eee")
+                fig.update_yaxes(title_text=slope_label,secondary_y=False,showgrid=True,gridcolor="#eee",
+                                 zeroline=False,title_font=dict(size=10),row=1,col=1)
+                fig.update_yaxes(title_text="收盤價(USD)",secondary_y=True,showgrid=False,zeroline=False,
+                                 title_font=dict(size=10,color=color),tickfont=dict(color=color),row=1,col=1)
+                if show_vol:
+                    fig.update_yaxes(title_text="成交量",showgrid=True,gridcolor="#eee",zeroline=False,
+                                     title_font=dict(size=10),tickformat=".2s",row=2,col=1)
 
-            # 在主圖上疊加買賣點
-            if show_flatten:
-                fig.add_trace(go.Scatter(
-                    x=buy50_x, y=buy50_y, name="買入(50%)", mode="markers",
-                    marker=dict(color="#1D9E75", size=8, symbol="triangle-up"),
-                    hovertemplate="買入50%%<br>%{x}<br>$%{y:.2f}<extra></extra>"), row=1, col=1, secondary_y=True)
-                fig.add_trace(go.Scatter(
-                    x=buyall_x, y=buyall_y, name="買入(ALL IN)", mode="markers",
-                    marker=dict(color="#085041", size=11, symbol="triangle-up"),
-                    hovertemplate="ALL IN<br>%{x}<br>$%{y:.2f}<extra></extra>"), row=1, col=1, secondary_y=True)
-                fig.add_trace(go.Scatter(
-                    x=sell_x, y=sell_y, name="賣出", mode="markers",
-                    marker=dict(color="#A32D2D", size=10, symbol="triangle-down"),
-                    hovertemplate="賣出<br>%{x}<br>$%{y:.2f}<extra></extra>"), row=1, col=1, secondary_y=True)
-
-            if vol_row:
-                fig.add_trace(go.Bar(x=dates,y=volumes,name="成交量",marker_color=vol_colors,
-                    hovertemplate="%{x}<br>成交量: %{y:,.0f}<extra></extra>"),row=vol_row,col=1)
-
-            if asset_row:
-                fig.add_trace(go.Scatter(
-                    x=eq_dates, y=eq_vals, name="策略資產", mode="lines",
-                    line=dict(color="#1D9E75", width=2),
-                    hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>"), row=asset_row, col=1)
-                if bah_curve:
-                    fig.add_trace(go.Scatter(
-                        x=eq_dates, y=bah_curve, name="買入持有", mode="lines",
-                        line=dict(color="rgba(136,136,136,0.6)", width=1.5, dash="dash"),
-                        hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>"), row=asset_row, col=1)
-
-            fig.add_hline(y=0,line_color="#ccc",line_width=1,row=1,col=1)
-            title_extra = ""
-            if show_flatten:
-                bah_ret2 = flatten_res["bah_ret"]
-                bah_str = f"{bah_ret2:+.2f}%" if bah_ret2 is not None else "—"
-                title_extra = f"　｜　跌勢趨緩策略 {flatten_res['total_ret']:+.2f}%　vs　買入持有 {bah_str}"
-            fig.update_layout(
-                title=dict(text=f"<b>{ticker}</b>　{window}日斜率　{date_range_str}{title_extra}",
-                           font=dict(size=13,color="#1a1a1a"),x=0),
-                barmode="overlay",bargap=0,hovermode="x unified",
-                legend=dict(orientation="h",yanchor="bottom",y=1.06,xanchor="right",x=1,font=dict(size=11)),
-                plot_bgcolor="white",paper_bgcolor="white",
-                margin=dict(l=60,r=65,t=50,b=40),
-                font=dict(family="sans-serif",size=12),height=chart_height)
-            fig.update_xaxes(showgrid=True,gridcolor="#eee")
-            # Y 軸自動縮放：計算斜率的合理範圍
-            valid_slopes = [v for v in slope_line if v is not None]
-            if valid_slopes and interval == "1wk":
-                s_max = max(abs(v) for v in valid_slopes)
-                s_range = [-s_max*1.1, s_max*1.1] if s_max > 0 else [-1, 1]
-            else:
-                s_range = [None, None]
-            y_range_kwargs = {"range": s_range} if s_range[0] is not None else {}
-            fig.update_yaxes(title_text=slope_label,secondary_y=False,showgrid=True,gridcolor="#eee",
-                             zeroline=False,title_font=dict(size=10),row=1,col=1,
-                             **y_range_kwargs)
-            fig.update_yaxes(title_text="收盤價(USD)",secondary_y=True,showgrid=False,zeroline=False,
-                             title_font=dict(size=10,color=color),tickfont=dict(color=color),row=1,col=1)
-            if vol_row:
-                fig.update_yaxes(title_text="成交量",showgrid=True,gridcolor="#eee",zeroline=False,
-                                 title_font=dict(size=10),tickformat=".2s",row=vol_row,col=1)
-            if asset_row:
-                fig.update_yaxes(title_text="資產(USD)",showgrid=True,gridcolor="#eee",zeroline=False,
-                                 title_font=dict(size=10),tickformat=",.0f",row=asset_row,col=1)
-
-            # 日/週/月乖離率計算
-            def ma_dev(closes, n):
-                if len(closes) < n: return None
-                ma = sum(closes[-n:]) / n
-                return round((closes[-1] - ma) / ma * 100, 2)
-
-            # 日乖離率：5日MA、20日MA、60日MA
-            # 週乖離率：用5週(25日)、10週(50日)
-            # 月乖離率：用3月(60日)、6月(120日)
-            dev_specs = [
-                ("5日均",    5,   "日"),
-                ("20日均",   20,  "日"),
-                ("60日均",   60,  "日"),
-                ("5週均",    25,  "週"),
-                ("10週均",   50,  "週"),
-                ("3月均",    60,  "月"),
-                ("6月均",    120, "月"),
-            ]
-
+            # 乖離率
+            def ma_dev(c, n):
+                if len(c) < n: return None
+                ma = sum(c[-n:]) / n
+                return round((c[-1] - ma) / ma * 100, 2)
+            dev_specs = [("5日均",5,"日"),("20日均",20,"日"),("60日均",60,"日"),
+                         ("5週均",25,"週"),("10週均",50,"週"),("3月均",60,"月"),("6月均",120,"月")]
             dev_cards = []
             for ma_name, n, period in dev_specs:
                 dev = ma_dev(closes, n)
@@ -1220,44 +2257,138 @@ def update_content(n_clicks, ticker_str, window, show_volume, days, interval):
                 ], style={"textAlign":"center","padding":"6px 10px","background":"#f5f5f3",
                           "borderRadius":"6px","minWidth":"70px"}))
 
+            # ── 三層多時間框架分析 ──
+            if interval == "1d":
+                try:
+                    sig, res, _, err = multi_timeframe_strategy(ticker, end_dt, 100000)
+                except Exception as mtf_ex:
+                    sig, res, err = None, None, str(mtf_ex)
+
+                # 偵錯：顯示原始結果
+                debug_info = html.Div(
+                    f"MTF結果 sig={sig is not None} res={res is not None} err={err}"
+                    + (f" | 月={sig['mo_cur']} 週={sig['wk_cur']} 日={sig['day_cur']} 日前={sig['day_prev']} L1={sig['l1_ok']} L2={sig['l2_ok']} L3跌緩={sig['l3_ok']} L3負正={sig['l3_n2p']}" if sig else ""),
+                    style={"fontSize":"11px","color":"#aaa","padding":"4px 12px"})
+
+                if sig and res:
+                    def lamp(ok, val, label):
+                        color = "#0F6E56" if ok else "#A32D2D"
+                        icon  = "🟢" if ok else "🔴"
+                        return html.Div([
+                            html.Div(label, style={"fontSize":"10px","color":"#aaa"}),
+                            html.Span(icon, style={"fontSize":"18px"}),
+                            html.Div(f"{val:+.1f}%" if val else "—",
+                                     style={"fontSize":"12px","fontWeight":"500","color":color}),
+                        ], style={"textAlign":"center","padding":"8px 12px",
+                                  "background":"#f5f5f3","borderRadius":"8px","minWidth":"80px"})
+
+                    # 判斷是否為最佳轉折點（跌勢擴大→趨緩）
+                    day_prev2_val = None
+                    if sig.get("day_prev") is not None and sig.get("day_cur") is not None:
+                        # 用 s_day 最後三個有效值判斷
+                        valid_days = [s for s in s_day if not math.isnan(s)] if 'multi_timeframe_strategy' else []
+
+                    d_cur  = sig.get("day_cur")  or 0
+                    d_prev = sig.get("day_prev") or 0
+                    l3_flatten   = d_cur < 0 and d_prev < 0 and abs(d_cur) < abs(d_prev)
+                    l3_expanding = d_cur < 0 and d_prev < 0 and abs(d_cur) > abs(d_prev)
+
+                    l3_label = ("跌勢擴大→趨緩 🎯 最佳ALL IN！" if (sig["l3_ok"] and l3_expanding)
+                                else "跌勢趨緩 📊" if sig["l3_ok"]
+                                else "負轉正 ⚡" if sig["l3_n2p"]
+                                else ("🚀 動能強勁" if d_cur > 100
+                                      else "📈 動能向上") if sig.get("l3_pos")
+                                else "跌勢擴大 📉")
+                    all_ok = sig["l1_ok"] and sig["l2_ok"] and (sig["l3_ok"] or sig["l3_n2p"] or sig.get("l3_pos"))
+                    signal_color = "#0F6E56" if all_ok else "#888"
+                    ret_color = "#0F6E56" if res["total_ret"] >= 0 else "#A32D2D"
+                    bah_color = "#0F6E56" if res["bah_ret"]   >= 0 else "#A32D2D"
+                    beat = res["final_val"] > res["bah_final"]
+
+                    eq_dates = [p["date"] for p in res["equity"]]
+                    eq_vals  = [p["val"]  for p in res["equity"]]
+                    fig_mtf = go.Figure()
+                    fig_mtf.add_trace(go.Scatter(x=eq_dates, y=eq_vals, name="三層策略",
+                        mode="lines", line=dict(color="#0F6E56", width=2),
+                        hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>"))
+                    bah_v = res["closes"][0]
+                    date_to_idx = {d: i for i, d in enumerate(res["dates"])}
+                    bah_curve = [100000 * (res["closes"][date_to_idx[d]] / bah_v)
+                                 if d in date_to_idx else None for d in eq_dates]
+                    fig_mtf.add_trace(go.Scatter(x=eq_dates, y=bah_curve, name="買入持有",
+                        mode="lines", line=dict(color="rgba(136,136,136,0.6)", width=1.5, dash="dash"),
+                        hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>"))
+                    fig_mtf.update_layout(
+                        title=dict(text="三層策略 vs 買入持有", font=dict(size=12), x=0),
+                        hovermode="x unified", height=200,
+                        plot_bgcolor="white", paper_bgcolor="white",
+                        legend=dict(orientation="h", y=1.1, x=1, xanchor="right", font=dict(size=11)),
+                        margin=dict(l=55,r=20,t=40,b=30),
+                        xaxis=dict(showgrid=True,gridcolor="#eee"),
+                        yaxis=dict(showgrid=True,gridcolor="#eee",tickformat=",.0f"))
+
+                    mtf_section = html.Div([
+                        debug_info,
+                        html.Div([
+                            html.Div("📊 三層多時間框架確認",
+                                     style={"fontSize":"12px","fontWeight":"500","color":"#1a1a1a",
+                                            "alignSelf":"center","marginRight":"8px","whiteSpace":"nowrap"}),
+                            lamp(sig["l1_ok"], sig["mo_cur"],  "L1 月線"),
+                            lamp(sig["l2_ok"], sig["wk_cur"],  "L2 週線"),
+                            html.Div([
+                                html.Div("L3 日線", style={"fontSize":"10px","color":"#aaa"}),
+                                html.Div(l3_label, style={"fontSize":"12px","fontWeight":"500","color":signal_color}),
+                                html.Div(f"{sig['day_cur']:+.1f}%" if sig['day_cur'] else "—",
+                                         style={"fontSize":"11px","color":"#888"}),
+                            ], style={"textAlign":"center","padding":"8px 12px",
+                                      "background":"#f5f5f3","borderRadius":"8px","minWidth":"110px"}),
+                            html.Div(
+                                "✅ 三層確認，可考慮進場" if all_ok else "⏳ 等待訊號對齊",
+                                style={"fontSize":"13px","fontWeight":"500","color":signal_color,
+                                       "alignSelf":"center","marginLeft":"8px",
+                                       "padding":"6px 12px","borderRadius":"6px",
+                                       "background":"#f0faf5" if all_ok else "#f5f5f3"}),
+                        ], style={"display":"flex","gap":"8px","padding":"10px 12px",
+                                  "borderTop":"0.5px solid #f0f0f0","flexWrap":"wrap","alignItems":"center"}),
+                        html.Div([
+                            html.Div([
+                                html.Div("三層策略報酬", style={"fontSize":"10px","color":"#aaa"}),
+                                html.Div(f"{res['total_ret']:+.2f}%",
+                                         style={"fontSize":"18px","fontWeight":"500","color":ret_color}),
+                                html.Div(f"${res['final_val']/10000:.2f}萬",
+                                         style={"fontSize":"11px","color":ret_color}),
+                            ], style={"background":"#f0faf5" if res['total_ret']>=0 else "#fff5f5",
+                                      "borderRadius":"8px","padding":"8px 12px","flex":"1",
+                                      "border":f"1.5px solid {'#1D9E75' if res['total_ret']>=0 else '#A32D2D'}"}),
+                            html.Div([
+                                html.Div("買入持有", style={"fontSize":"10px","color":"#aaa"}),
+                                html.Div(f"{res['bah_ret']:+.2f}%",
+                                         style={"fontSize":"18px","fontWeight":"500","color":bah_color}),
+                                html.Div(f"${res['bah_final']/10000:.2f}萬",
+                                         style={"fontSize":"11px","color":bah_color}),
+                            ], style={"background":"#f5f5f3","borderRadius":"8px","padding":"8px 12px","flex":"1"}),
+                            html.Div([
+                                html.Div("最大回撤", style={"fontSize":"10px","color":"#aaa"}),
+                                html.Div(f"-{res['max_dd']:.1f}%",
+                                         style={"fontSize":"18px","fontWeight":"500","color":"#A32D2D"}),
+                                html.Div("✅ 贏過買持" if beat else "❌ 輸給買持",
+                                         style={"fontSize":"11px","color":"#0F6E56" if beat else "#A32D2D"}),
+                            ], style={"background":"#f5f5f3","borderRadius":"8px","padding":"8px 12px","flex":"1"}),
+                        ], style={"display":"flex","gap":"8px","padding":"0 12px 8px","flexWrap":"wrap"}),
+                        dcc.Graph(figure=fig_mtf, config={"displayModeBar":False}),
+                    ])
+                else:
+                    mtf_section = html.Div([
+                        debug_info,
+                        html.P(f"⚠️ 三層分析：{err or '資料不足'}",
+                               style={"fontSize":"12px","color":"#dc2626","padding":"8px 12px"}),
+                    ])
+            else:
+                mtf_section = html.Div()
+
             chart_divs.append(html.Div([
                 dcc.Graph(figure=fig,config={"displayModeBar":False}),
-                # 策略績效 vs 買入持有
-                *([ html.Div([
-                    html.Div([
-                        html.Div("跌勢趨緩策略", style={"fontSize":"11px","color":"#888","marginBottom":"3px"}),
-                        html.Div(f"{flatten_res['total_ret']:+.2f}%",
-                                 style={"fontSize":"20px","fontWeight":"500",
-                                        "color":"#0F6E56" if flatten_res['total_ret']>=0 else "#A32D2D"}),
-                        html.Div(f"${flatten_res['final_val']/10000:.2f}萬（初始10萬）",
-                                 style={"fontSize":"11px","color":"#aaa"}),
-                        html.Div(f"買入{flatten_res['buy_count']}次 / 賣出{flatten_res['sell_count']}次",
-                                 style={"fontSize":"11px","color":"#aaa"}),
-                    ], style={"background":"#f0faf5","borderRadius":"8px","padding":"10px 14px","flex":"1",
-                              "border":"1.5px solid #1D9E75"}),
-                    html.Div([
-                        html.Div("買入持有", style={"fontSize":"11px","color":"#888","marginBottom":"3px"}),
-                        html.Div(f"{flatten_res['bah_ret']:+.2f}%" if flatten_res.get('bah_ret') is not None else "—",
-                                 style={"fontSize":"20px","fontWeight":"500",
-                                        "color":"#0F6E56" if (flatten_res.get('bah_ret') or 0)>=0 else "#A32D2D"}),
-                        html.Div(f"${flatten_res['bah_final']/10000:.2f}萬（初始10萬）" if flatten_res.get('bah_final') else "—",
-                                 style={"fontSize":"11px","color":"#aaa"}),
-                        html.Div("一買到底不動作",
-                                 style={"fontSize":"11px","color":"#aaa"}),
-                    ], style={"background":"#f5f5f3","borderRadius":"8px","padding":"10px 14px","flex":"1"}),
-                    html.Div([
-                        html.Div("策略勝出", style={"fontSize":"11px","color":"#888","marginBottom":"3px"}),
-                        html.Div("✅ 是" if flatten_res['final_val'] > (flatten_res.get('bah_final') or 0)
-                                 else "❌ 否",
-                                 style={"fontSize":"20px","fontWeight":"500",
-                                        "color":"#0F6E56" if flatten_res['final_val'] > (flatten_res.get('bah_final') or 0)
-                                        else "#A32D2D"}),
-                        html.Div(f"差距 {flatten_res['total_ret'] - (flatten_res.get('bah_ret') or 0):+.2f}%",
-                                 style={"fontSize":"11px","color":"#888"}),
-                    ], style={"background":"#f5f5f3","borderRadius":"8px","padding":"10px 14px","flex":"1"}),
-                ], style={"display":"flex","gap":"10px","padding":"10px 12px",
-                          "borderTop":"0.5px solid #f0f0f0","flexWrap":"wrap"})
-                ] if show_flatten else []),
+                mtf_section,
                 html.Div([
                     html.Span(f"{ticker}　乖離率：",
                               style={"fontSize":"12px","color":"#888","alignSelf":"center","marginRight":"8px"}),
@@ -1266,6 +2397,7 @@ def update_content(n_clicks, ticker_str, window, show_volume, days, interval):
                           "borderTop":"0.5px solid #f0f0f0","alignItems":"center"}),
             ], style={"marginBottom":"16px","border":"0.5px solid #e5e5e5",
                       "borderRadius":"10px","overflow":"hidden","background":"white"}))
+
 
     # ── 回測分析 ──
     backtest_divs = []
@@ -2030,6 +3162,600 @@ def update_index_overview(n_clicks):
     return table, "📋 重新載入"
 
 
+@app.callback(
+    Output("six-state-div","children"),
+    Input("six-state-btn","n_clicks"),
+    State("six-state-ticker","value"),
+    prevent_initial_call=True,
+)
+def update_six_state(n_clicks, ticker_input):
+    if not n_clicks:
+        return html.Div()
+
+    ticker = (ticker_input or "QQQ").strip().upper()
+    end_dt   = datetime.datetime.now(tz=timezone.utc)
+    start_dt = end_dt - datetime.timedelta(days=365*3)
+
+    try:
+        dates_d, day_closes, _, _ = fetch_yahoo_range(ticker, start_dt, end_dt, "1d")
+    except Exception as e:
+        return html.P(f"資料抓取失敗：{e}", style={"color":"#dc2626","fontSize":"13px"})
+
+    if len(day_closes) < 130:
+        return html.P("資料不足", style={"color":"#aaa","fontSize":"13px"})
+
+    summary_entry, summary_exit, bah_total = analyze_six_states(day_closes, dates_d)
+    if not summary_entry:
+        return html.P("組合樣本不足", style={"color":"#aaa","fontSize":"13px"})
+
+    summary = summary_entry  # 用進場排名顯示完整表格
+
+    # 顏色輔助
+    STATE_COLOR = {
+        "加速上升": "#0F6E56", "減速上升": "#16a34a",
+        "由負轉正": "#0891b2", "由正轉負": "#dc2626",
+        "減速下跌": "#d97706", "加速下跌": "#7f1d1d",
+    }
+    STATE_ICON = {
+        "加速上升":"🚀", "減速上升":"📈",
+        "由負轉正":"⚡", "由正轉負":"🔻",
+        "減速下跌":"📊", "加速下跌":"🔴",
+    }
+
+    th = {"padding":"5px 10px","textAlign":"left","fontSize":"11px",
+          "color":"#888","borderBottom":"1px solid #eee","whiteSpace":"nowrap"}
+
+    def state_badge(st):
+        c = STATE_COLOR.get(st, "#888")
+        icon = STATE_ICON.get(st, "")
+        return html.Span(f"{icon}{st}",
+                         style={"color":c,"fontWeight":"500","fontSize":"12px"})
+
+    rows = []
+    for rank, r in enumerate(summary[:27]):
+        ret_color = "#0F6E56" if r["avg_ret"] >= 0 else "#A32D2D"
+        fwd_color = "#0F6E56" if r["avg_fwd"] >= 0 else "#A32D2D"
+        win_color = "#0F6E56" if r["win_rate"] >= 50 else "#A32D2D"
+        rows.append(html.Tr([
+            html.Td(f"#{rank+1}", style={"padding":"5px 10px","fontSize":"11px","color":"#aaa"}),
+            html.Td(state_badge(r["l1"]), style={"padding":"5px 10px"}),
+            html.Td(state_badge(r["l2"]), style={"padding":"5px 10px"}),
+            html.Td(state_badge(r["l3"]), style={"padding":"5px 10px"}),
+            html.Td(f"{r['avg_ret']:+.2f}%",
+                    style={"padding":"5px 10px","fontWeight":"500","color":ret_color}),
+            html.Td(f"{r['avg_fwd']:+.2f}%",
+                    style={"padding":"5px 10px","color":fwd_color}),
+            html.Td(f"{r['best']:+.1f}%",
+                    style={"padding":"5px 10px","color":"#0F6E56","fontSize":"11px"}),
+            html.Td(f"{r['worst']:+.1f}%",
+                    style={"padding":"5px 10px","color":"#A32D2D","fontSize":"11px"}),
+            html.Td(f"{r['win_rate']}%",
+                    style={"padding":"5px 10px","color":win_color}),
+            html.Td(f"{r['count']}筆",
+                    style={"padding":"5px 10px","color":"#888","fontSize":"11px"}),
+        ], style={"borderBottom":"0.5px solid #f5f5f5",
+                  "background":"#f0faf5" if rank < 3 else "white"}))
+
+    # 今日狀態
+    s1 = rolling_annualized_log_slope(day_closes, 120, 252)
+    s2 = rolling_annualized_log_slope(day_closes,  40, 252)
+    s3 = rolling_annualized_log_slope(day_closes,  10, 252)
+    today_l1 = slope_state(s1[-1] if not math.isnan(s1[-1]) else None,
+                            s1[-2] if len(s1)>1 and not math.isnan(s1[-2]) else None)
+    today_l2 = slope_state(s2[-1] if not math.isnan(s2[-1]) else None,
+                            s2[-2] if len(s2)>1 and not math.isnan(s2[-2]) else None)
+    today_l3 = slope_state(s3[-1] if not math.isnan(s3[-1]) else None,
+                            s3[-2] if len(s3)>1 and not math.isnan(s3[-2]) else None)
+
+    # 找今日組合的排名
+    today_combo = next(
+        (r for r in summary if r["l1"]==today_l1 and r["l2"]==today_l2 and r["l3"]==today_l3), None)
+
+    today_box = html.Div([
+        html.Div("📍 今日狀態",
+                 style={"fontSize":"12px","fontWeight":"500","color":"#1a1a1a","marginBottom":"8px"}),
+        html.Div([
+            html.Div([
+                html.Div("L1 月線", style={"fontSize":"10px","color":"#aaa"}),
+                state_badge(today_l1),
+            ], style={"flex":"1","textAlign":"center"}),
+            html.Div([
+                html.Div("L2 週線", style={"fontSize":"10px","color":"#aaa"}),
+                state_badge(today_l2),
+            ], style={"flex":"1","textAlign":"center"}),
+            html.Div([
+                html.Div("L3 日線", style={"fontSize":"10px","color":"#aaa"}),
+                state_badge(today_l3),
+            ], style={"flex":"1","textAlign":"center"}),
+        ], style={"display":"flex","gap":"8px","marginBottom":"8px"}),
+        html.Div(
+            f"歷史排名：#{summary.index(today_combo)+1}　平均持有報酬：{today_combo['avg_ret']:+.2f}%　勝率：{today_combo['win_rate']}%　樣本：{today_combo['count']}筆"
+            if today_combo else "此組合歷史樣本不足",
+            style={"fontSize":"13px","fontWeight":"500",
+                   "color":"#0F6E56" if today_combo and today_combo['avg_ret']>0 else "#888"}),
+    ], style={"background":"#f5f5f3","borderRadius":"10px","padding":"12px 16px","marginBottom":"12px"})
+
+    table = html.Div(html.Table([
+        html.Thead(html.Tr([
+            html.Th("排名",style=th),
+            html.Th("L1 月線",style=th), html.Th("L2 週線",style=th), html.Th("L3 日線",style=th),
+            html.Th("持有到今報酬",style=th),
+            html.Th("5天後報酬",style=th),
+            html.Th("最佳",style=th), html.Th("最差",style=th),
+            html.Th("勝率",style=th), html.Th("樣本",style=th),
+        ], style={"background":"#f9f9f9"})),
+        html.Tbody(rows),
+    ], style={"width":"100%","borderCollapse":"collapse","fontSize":"12px"}),
+    style={"overflowX":"auto","border":"0.5px solid #e5e5e5","borderRadius":"10px","background":"white"})
+
+    # 最佳進場（報酬最高前3）和最佳出場（報酬最低前3）
+    best_entry  = summary_entry[:3]
+    worst_entry = summary_exit[:3]  # 未來N天報酬最差的組合
+
+    def signal_cards(items, title, color, bg, use_fwd=False):
+        cards = []
+        for i, r in enumerate(items):
+            ret_val  = r["avg_fwd"]  if use_fwd else r["avg_ret"]
+            win_val  = r["win_fwd"]  if use_fwd else r["win_rate"]
+            ret_label= "5日後報酬" if use_fwd else "持有至今"
+            cards.append(html.Div([
+                html.Div(f"#{i+1}", style={"fontSize":"10px","color":"#aaa","marginBottom":"2px"}),
+                html.Div([state_badge(r["l1"])], style={"marginBottom":"2px"}),
+                html.Div([state_badge(r["l2"])], style={"marginBottom":"2px"}),
+                html.Div([state_badge(r["l3"])], style={"marginBottom":"4px"}),
+                html.Div(f"{ret_val:+.2f}%",
+                         style={"fontSize":"13px","fontWeight":"500","color":color}),
+                html.Div(f"{ret_label}　勝率 {win_val}%",
+                         style={"fontSize":"11px","color":"#888"}),
+            ], style={"background":bg,"borderRadius":"8px","padding":"10px 12px",
+                      "flex":"1","border":f"1.5px solid {color}"}))
+        return html.Div([
+            html.Div(title, style={"fontSize":"12px","fontWeight":"500","color":color,
+                                    "marginBottom":"8px"}),
+            html.Div(cards, style={"display":"flex","gap":"8px"}),
+        ], style={"marginBottom":"12px"})
+
+    signals_box = html.Div([
+        signal_cards(best_entry,  "✅ 最佳進場訊號（持有到今報酬最高）",    "#0F6E56", "#f0faf5", use_fwd=False),
+        signal_cards(worst_entry, "🚪 最佳出場訊號（出現後5天報酬最差）",    "#dc2626", "#fff5f5", use_fwd=True),
+    ])
+
+    # ── 配對回測：Top10進場 × Top10出場 ──
+    top_entry = set((r["l1"],r["l2"],r["l3"]) for r in summary_entry[:10])
+    top_exit  = set((r["l1"],r["l2"],r["l3"]) for r in summary_exit[:10])
+
+    paired = paired_backtest(day_closes, dates_d, top_entry, top_exit)
+
+    # 買入/賣出點
+    buy_x  = [t["date"]  for t in paired["trades"] if t["action"]=="買入"]
+    buy_y  = [t["price"] for t in paired["trades"] if t["action"]=="買入"]
+    sell_x = [t["date"]  for t in paired["trades"] if t["action"]=="賣出"]
+    sell_y = [t["price"] for t in paired["trades"] if t["action"]=="賣出"]
+
+    # 資產走勢
+    eq_dates = [p["date"] for p in paired["equity"]]
+    eq_vals  = [p["val"]  for p in paired["equity"]]
+    date_idx = {d:i for i,d in enumerate(paired["dates"])}
+    bah_vals = [100000*(paired["closes"][date_idx[d]]/paired["closes"][0])
+                if d in date_idx else None for d in eq_dates]
+
+    # 上下雙子圖：股價+買賣點 / 資產走勢
+    fig_pair = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                              row_heights=[0.55, 0.45], vertical_spacing=0.05,
+                              subplot_titles=("股價走勢與買賣點", "資產走勢"))
+
+    # 股價線
+    fig_pair.add_trace(go.Scatter(
+        x=paired["dates"], y=paired["closes"], name="收盤價", mode="lines",
+        line=dict(color="#2563eb", width=1.5),
+        hovertemplate="%{x}<br>$%{y:.2f}<extra></extra>"), row=1, col=1)
+    # 買入點
+    fig_pair.add_trace(go.Scatter(
+        x=buy_x, y=buy_y, name="買入", mode="markers",
+        marker=dict(color="#0F6E56", size=10, symbol="triangle-up"),
+        hovertemplate="買入<br>%{x}<br>$%{y:.2f}<extra></extra>"), row=1, col=1)
+    # 賣出點
+    fig_pair.add_trace(go.Scatter(
+        x=sell_x, y=sell_y, name="賣出", mode="markers",
+        marker=dict(color="#dc2626", size=10, symbol="triangle-down"),
+        hovertemplate="賣出<br>%{x}<br>$%{y:.2f}<extra></extra>"), row=1, col=1)
+
+    # 資產走勢
+    fig_pair.add_trace(go.Scatter(
+        x=eq_dates, y=eq_vals, name="配對策略",
+        mode="lines", line=dict(color="#0F6E56", width=2),
+        hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>"), row=2, col=1)
+    fig_pair.add_trace(go.Scatter(
+        x=eq_dates, y=bah_vals, name="買入持有",
+        mode="lines", line=dict(color="rgba(136,136,136,0.6)", width=1.5, dash="dash"),
+        hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>"), row=2, col=1)
+
+    fig_pair.update_layout(
+        title=dict(text="配對策略（Top10進場×Top10出場）", font=dict(size=12), x=0),
+        hovermode="x unified", height=480,
+        plot_bgcolor="white", paper_bgcolor="white",
+        legend=dict(orientation="h", y=1.06, x=1, xanchor="right", font=dict(size=11)),
+        margin=dict(l=55,r=20,t=50,b=30))
+    fig_pair.update_xaxes(showgrid=True, gridcolor="#eee")
+    fig_pair.update_yaxes(title_text="價格", showgrid=True, gridcolor="#eee",
+                          tickformat=",.0f", row=1, col=1)
+    fig_pair.update_yaxes(title_text="資產(USD)", showgrid=True, gridcolor="#eee",
+                          tickformat=",.0f", row=2, col=1)
+
+    ret_color = "#0F6E56" if paired["total_ret"] >= 0 else "#A32D2D"
+    bah_color = "#0F6E56" if paired["bah_ret"]   >= 0 else "#A32D2D"
+    beat = paired["final_val"] > paired["bah_final"]
+
+    paired_box = html.Div([
+        html.Div("📈 配對回測結果（Top10進場組合 + Top10出場組合）",
+                 style={"fontSize":"13px","fontWeight":"500","color":"#1a1a1a",
+                        "padding":"10px 12px","borderBottom":"0.5px solid #eee"}),
+        html.Div([
+            html.Div([
+                html.Div("策略報酬", style={"fontSize":"10px","color":"#aaa"}),
+                html.Div(f"{paired['total_ret']:+.2f}%",
+                         style={"fontSize":"20px","fontWeight":"500","color":ret_color}),
+                html.Div(f"${paired['final_val']/10000:.2f}萬",
+                         style={"fontSize":"11px","color":ret_color}),
+            ], style={"background":"#f0faf5" if beat else "#fff5f5","borderRadius":"8px",
+                      "padding":"10px 14px","flex":"1",
+                      "border":f"1.5px solid {'#0F6E56' if beat else '#A32D2D'}"}),
+            html.Div([
+                html.Div("買入持有", style={"fontSize":"10px","color":"#aaa"}),
+                html.Div(f"{paired['bah_ret']:+.2f}%",
+                         style={"fontSize":"20px","fontWeight":"500","color":bah_color}),
+                html.Div(f"${paired['bah_final']/10000:.2f}萬",
+                         style={"fontSize":"11px","color":bah_color}),
+            ], style={"background":"#f5f5f3","borderRadius":"8px","padding":"10px 14px","flex":"1"}),
+            html.Div([
+                html.Div("最大回撤", style={"fontSize":"10px","color":"#aaa"}),
+                html.Div(f"-{paired['max_dd']:.1f}%",
+                         style={"fontSize":"20px","fontWeight":"500","color":"#A32D2D"}),
+                html.Div(f"交易 {len(paired['trades'])} 筆",
+                         style={"fontSize":"11px","color":"#888"}),
+                html.Div("✅ 贏過買持" if beat else "❌ 輸給買持",
+                         style={"fontSize":"11px","color":"#0F6E56" if beat else "#A32D2D"}),
+            ], style={"background":"#f5f5f3","borderRadius":"8px","padding":"10px 14px","flex":"1"}),
+        ], style={"display":"flex","gap":"8px","padding":"10px 12px","flexWrap":"wrap"}),
+        dcc.Graph(figure=fig_pair, config={"displayModeBar":False}),
+    ], style={"border":"0.5px solid #e5e5e5","borderRadius":"10px",
+              "overflow":"hidden","background":"white","marginBottom":"12px"})
+
+    return html.Div([
+        html.P(f"分析標的：{ticker}　近3年日線資料 {len(day_closes)} 筆　從頭到尾單筆買入持有報酬：{bah_total:+.2f}%",
+               style={"fontSize":"11px","color":"#aaa","margin":"0 0 10px"}),
+        today_box,
+        signals_box,
+        paired_box,
+        table,
+    ])
+
+
+def track_option_wall(ticker, put_wall, call_wall):
+    """追蹤 Put/Call 牆的歷史移動，回傳變動分析文字"""
+    filename = f"option_history_{ticker}.json"
+    today    = datetime.date.today().isoformat()
+
+    if os.path.exists(filename):
+        with open(filename, "r") as f:
+            history = json.load(f)
+    else:
+        history = {}
+
+    prev_date = list(history.keys())[-1] if history else None
+    put_note  = ""
+    call_note = ""
+
+    if prev_date and prev_date != today:
+        prev_put  = history[prev_date].get("put_wall")
+        prev_call = history[prev_date].get("call_wall")
+        if prev_put is not None:
+            if put_wall > prev_put:
+                put_note = f"⚠️ 支撐上移：${prev_put}→${put_wall}（買盤轉強）"
+            elif put_wall < prev_put:
+                put_note = f"⚠️ 支撐下移：${prev_put}→${put_wall}（防守力轉弱）"
+            else:
+                put_note = "✅ 支撐穩定"
+        if prev_call is not None:
+            if call_wall > prev_call:
+                call_note = f"⚠️ 阻力上移：${prev_call}→${call_wall}（賣壓減輕）"
+            elif call_wall < prev_call:
+                call_note = f"⚠️ 阻力下移：${prev_call}→${call_wall}（賣壓增強）"
+            else:
+                call_note = "✅ 阻力穩定"
+    else:
+        put_note  = "開始追蹤" if not prev_date else "今日已記錄"
+        call_note = ""
+
+    history[today] = {"put_wall": put_wall, "call_wall": call_wall}
+    try:
+        with open(filename, "w") as f:
+            json.dump(history, f, indent=2)
+    except: pass
+
+    return put_note, call_note
+
+
+@app.callback(
+    Output("opt-div","children"),
+    Input("opt-btn","n_clicks"),
+    State("opt-ticker","value"),
+    prevent_initial_call=True,
+)
+def update_options(n_clicks, ticker_input):
+    if not n_clicks:
+        return html.Div()
+
+    ticker = (ticker_input or "QQQ").strip().upper()
+
+    try:
+        import yfinance as yf
+        import math as _math
+
+        t       = yf.Ticker(ticker)
+        spot    = t.fast_info.get("lastPrice") or t.fast_info.last_price
+        exps    = t.options
+        if not exps:
+            return html.P("無法取得期權數據", style={"color":"#aaa","fontSize":"13px"})
+
+        today   = datetime.date.today()
+
+        # 找最近4個到期日
+        exp_dates = []
+        for e in exps[:8]:
+            ed = datetime.date.fromisoformat(e)
+            exp_dates.append((e, ed, (ed - today).days))
+
+        # 抓近月和次月
+        near_exps  = exp_dates[:2]
+
+        # 結算日判斷（週五=4，週三=2）
+        settle_flags = []
+        for e, ed, days in near_exps:
+            dow = ed.weekday()
+            is_opex = (dow == 4)        # 月度結算通常是週五
+            is_gamma = (dow in [2,4])   # 週三/週五 Gamma 影響大
+            settle_flags.append((e, ed, days, is_opex, is_gamma))
+
+        # 彙整各到期日的Put/Call牆
+        all_puts  = {}  # strike → total OI
+        all_calls = {}
+        exp_data  = []
+
+        for e, ed, days, is_opex, is_gamma in settle_flags:
+            try:
+                chain = t.option_chain(e)
+                puts  = chain.puts[["strike","openInterest","impliedVolatility"]].dropna()
+                calls = chain.calls[["strike","openInterest","impliedVolatility"]].dropna()
+
+                # 累加跨月OI
+                for _, row in puts.iterrows():
+                    all_puts[row["strike"]]  = all_puts.get(row["strike"], 0)  + row["openInterest"]
+                for _, row in calls.iterrows():
+                    all_calls[row["strike"]] = all_calls.get(row["strike"], 0) + row["openInterest"]
+
+                # 計算Gamma Exposure（近似：Gamma ≈ OI × 100 × spot × IV / sqrt(T) × 0.01）
+                T = max(days/365, 1/365)
+                def approx_gamma_exp(df, is_put=False):
+                    gex = 0
+                    for _, row in df.iterrows():
+                        iv = row["impliedVolatility"]
+                        oi = row["openInterest"]
+                        k  = row["strike"]
+                        if iv > 0 and oi > 0:
+                            d1 = (_math.log(spot/k) + 0.5*iv*iv*T) / (iv*_math.sqrt(T))
+                            gamma = _math.exp(-d1*d1/2) / (spot * iv * _math.sqrt(2*_math.pi*T))
+                            g = gamma * oi * 100 * spot * spot * 0.01
+                            gex += (-g if is_put else g)
+                    return gex
+
+                gex_call = approx_gamma_exp(calls, is_put=False)
+                gex_put  = approx_gamma_exp(puts,  is_put=True)
+
+                exp_data.append({
+                    "exp": e, "days": days,
+                    "is_opex": is_opex, "is_gamma": is_gamma,
+                    "top_puts":  puts.nlargest(5,"openInterest")[["strike","openInterest"]].values.tolist(),
+                    "top_calls": calls.nlargest(5,"openInterest")[["strike","openInterest"]].values.tolist(),
+                    "gex_net": round((gex_call + gex_put)/1e6, 1),
+                })
+            except:
+                continue
+
+        if not exp_data:
+            return html.P("期權數據解析失敗", style={"color":"#aaa","fontSize":"13px"})
+
+        # 跨月雙重確認的強支撐/強阻力
+        top_put_strikes  = sorted(all_puts,  key=lambda k: all_puts[k],  reverse=True)[:5]
+        top_call_strikes = sorted(all_calls, key=lambda k: all_calls[k], reverse=True)[:5]
+
+        # 找最強支撐（最大Put OI且低於現價）和最強阻力（最大Call OI且高於現價）
+        support_strikes  = [(k, all_puts[k])  for k in top_put_strikes  if k < spot]
+        resist_strikes   = [(k, all_calls[k]) for k in top_call_strikes if k > spot]
+
+        main_support = support_strikes[0]  if support_strikes  else None
+        main_resist  = resist_strikes[0]   if resist_strikes   else None
+
+        # 跨月雙重確認
+        def dual_confirm(strike, exp_data_list, side="put"):
+            count = 0
+            for ed in exp_data_list:
+                key = "top_puts" if side=="put" else "top_calls"
+                strikes_in_exp = [r[0] for r in ed[key]]
+                if strike in strikes_in_exp:
+                    count += 1
+            return count >= 2
+
+        # ── 建議 ──
+        suggestions = []
+        if main_support and main_resist:
+            s_k, s_oi = main_support
+            r_k, r_oi = main_resist
+            s_dual = dual_confirm(s_k, exp_data, "put")
+            r_dual = dual_confirm(r_k, exp_data, "call")
+
+            dist_to_support = round((spot - s_k) / spot * 100, 1)
+            dist_to_resist  = round((r_k - spot) / spot * 100, 1)
+
+            if dist_to_support <= 2:
+                suggestions.append(("🟢 接近支撐位", f"現價 ${spot:.2f} 距 Put牆 ${s_k} 只有 {dist_to_support}%，可考慮買入", "buy"))
+            elif dist_to_resist <= 2:
+                suggestions.append(("🔴 接近阻力位", f"現價 ${spot:.2f} 距 Call牆 ${r_k} 只有 {dist_to_resist}%，可考慮減倉", "sell"))
+            else:
+                suggestions.append(("⚪ 區間中段", f"現價 ${spot:.2f}，支撐 ${s_k}（-{dist_to_support}%），阻力 ${r_k}（+{dist_to_resist}%）", "neutral"))
+
+        # 追蹤 Put/Call 牆歷史移動
+        put_note, call_note = track_option_wall(
+            ticker,
+            main_support[0] if main_support else 0,
+            main_resist[0]  if main_resist  else 0)
+
+        # ── LINE 訊息格式 ──
+        tw_time = datetime.datetime.now(
+            datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+
+        sug_text = suggestions[0][1] if suggestions else "區間中段，觀察方向"
+        sug_icon = suggestions[0][0] if suggestions else "⚪"
+
+        next_exp = exp_data[0] if exp_data else None
+        exp_line = ""
+        if next_exp:
+            gamma_tag = "⚠️ Gamma高峰" if next_exp["is_gamma"] else ""
+            opex_tag  = "📅 月結算" if next_exp["is_opex"] else ""
+            exp_line  = (f"📅 結算日 {next_exp['exp']}（{next_exp['days']}天後）"
+                        f"{'　'+gamma_tag if gamma_tag else ''}{'　'+opex_tag if opex_tag else ''}")
+
+        top_put_str  = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_puts or support_strikes)[:2]])
+        top_call_str = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_calls or resist_strikes)[:2]])
+
+        line_msg = (
+            f"【⚡ {ticker} 期權結構】\n{tw_time}\n\n"
+            f"📍 現價：${spot:.2f}\n"
+            f"{sug_icon} {sug_text}\n\n"
+            f"🔗 Put牆（支撐）：{top_put_str or '—'}\n"
+            f"🔗 Call牆（阻力）：{top_call_str or '—'}\n"
+        )
+        if put_note:  line_msg += f"{put_note}\n"
+        if call_note: line_msg += f"{call_note}\n"
+        if exp_line:  line_msg += f"\n{exp_line}"
+
+        # ── UI ──
+        def oi_bar(oi, max_oi):
+            pct = min(oi / max_oi * 100, 100) if max_oi > 0 else 0
+            return html.Div(style={"background":"#e5e7eb","borderRadius":"3px","height":"6px","width":"80px","display":"inline-block","verticalAlign":"middle","marginLeft":"6px","overflow":"hidden"},
+                            children=[html.Div(style={"background":"#7c3aed","width":f"{pct}%","height":"100%","borderRadius":"3px"})])
+
+        # 到期日卡片
+        exp_cards = []
+        for ed in exp_data:
+            gamma_flag = "⚠️ Gamma高峰日" if ed["is_gamma"] else ""
+            opex_flag  = "📅 月結算日" if ed["is_opex"] else ""
+            exp_cards.append(html.Div([
+                html.Div([
+                    html.Span(ed["exp"], style={"fontWeight":"500","fontSize":"13px"}),
+                    html.Span(f"  {ed['days']}天後", style={"fontSize":"11px","color":"#aaa","marginLeft":"6px"}),
+                    html.Span(f"  {opex_flag} {gamma_flag}", style={"fontSize":"11px","color":"#d97706","marginLeft":"6px"}),
+                ], style={"marginBottom":"6px"}),
+                html.Div([
+                    html.Div([
+                        html.Div("Put牆（支撐）", style={"fontSize":"10px","color":"#0F6E56","marginBottom":"3px","fontWeight":"500"}),
+                        *[html.Div([
+                            html.Span(f"${r[0]:.0f}", style={"fontSize":"12px","fontWeight":"500"}),
+                            html.Span(f"  OI {r[1]:,.0f}", style={"fontSize":"11px","color":"#888"}),
+                            oi_bar(r[1], ed["top_puts"][0][1] if ed["top_puts"] else 1),
+                        ], style={"marginBottom":"2px"}) for r in ed["top_puts"][:3]],
+                    ], style={"flex":"1"}),
+                    html.Div([
+                        html.Div("Call牆（阻力）", style={"fontSize":"10px","color":"#A32D2D","marginBottom":"3px","fontWeight":"500"}),
+                        *[html.Div([
+                            html.Span(f"${r[0]:.0f}", style={"fontSize":"12px","fontWeight":"500"}),
+                            html.Span(f"  OI {r[1]:,.0f}", style={"fontSize":"11px","color":"#888"}),
+                            oi_bar(r[1], ed["top_calls"][0][1] if ed["top_calls"] else 1),
+                        ], style={"marginBottom":"2px"}) for r in ed["top_calls"][:3]],
+                    ], style={"flex":"1"}),
+                ], style={"display":"flex","gap":"16px"}),
+                html.Div(f"Net GEX：{ed['gex_net']:+.1f}M　{'正GEX→做市商賣Gamma，價格被磁吸穩定' if ed['gex_net']>0 else '負GEX→做市商買Gamma，波動放大'}",
+                         style={"fontSize":"11px","color":"#7c3aed","marginTop":"6px"}),
+            ], style={"background":"white","borderRadius":"10px","padding":"12px 14px",
+                      "border":"0.5px solid #e5e5e5","marginBottom":"10px"}))
+
+        # 跨月雙重確認
+        max_put_oi  = max(all_puts.values())  if all_puts  else 1
+        max_call_oi = max(all_calls.values()) if all_calls else 1
+
+        dual_puts  = [(k, all_puts[k])  for k in top_put_strikes  if dual_confirm(k, exp_data,"put")]
+        dual_calls = [(k, all_calls[k]) for k in top_call_strikes if dual_confirm(k, exp_data,"call")]
+
+        dual_box = html.Div([
+            html.Div("🔗 跨月雙重確認（近月+次月同時存在 → 訊號更強）",
+                     style={"fontSize":"12px","fontWeight":"500","color":"#1a1a1a","marginBottom":"8px"}),
+            html.Div([
+                html.Div([
+                    html.Div("✅ 強支撐（雙月Put牆）", style={"fontSize":"11px","color":"#0F6E56","marginBottom":"4px"}),
+                ] + ([html.Div(f"${k:.0f}　累計OI {oi:,.0f}", style={"fontSize":"12px","fontWeight":"500","color":"#0F6E56"})
+                      for k,oi in dual_puts[:3]] or [html.Div("無", style={"fontSize":"11px","color":"#aaa"})]),
+                style={"flex":"1"}),
+                html.Div([
+                    html.Div("🚫 強阻力（雙月Call牆）", style={"fontSize":"11px","color":"#A32D2D","marginBottom":"4px"}),
+                ] + ([html.Div(f"${k:.0f}　累計OI {oi:,.0f}", style={"fontSize":"12px","fontWeight":"500","color":"#A32D2D"})
+                      for k,oi in dual_calls[:3]] or [html.Div("無", style={"fontSize":"11px","color":"#aaa"})]),
+                style={"flex":"1"}),
+            ], style={"display":"flex","gap":"16px"}),
+        ], style={"background":"#f5f5f3","borderRadius":"10px","padding":"12px 14px","marginBottom":"10px"})
+
+        # 買賣建議
+        sug_color = {"buy":"#0F6E56","sell":"#A32D2D","neutral":"#888"}
+        sug_bg    = {"buy":"#f0faf5","sell":"#fff5f5","neutral":"#f5f5f3"}
+        sug_box   = html.Div([
+            html.Div([
+                html.Div(s[0], style={"fontSize":"14px","fontWeight":"500",
+                                      "color":sug_color[s[2]]}),
+                html.Div(s[1], style={"fontSize":"12px","color":"#555","marginTop":"3px"}),
+            ], style={"background":sug_bg[s[2]],"borderRadius":"10px","padding":"12px 16px",
+                      "border":f"1.5px solid {sug_color[s[2]]}","marginBottom":"8px"})
+            for s in suggestions
+        ])
+
+        spot_label = html.Div(
+            f"📍 {ticker} 現價：${spot:.2f}",
+            style={"fontSize":"14px","fontWeight":"500","color":"#1a1a1a","marginBottom":"12px"})
+
+        line_preview = html.Div([
+            html.Div("📱 LINE 訊息預覽", style={"fontSize":"12px","fontWeight":"500",
+                     "color":"#1a1a1a","marginBottom":"8px"}),
+            html.Pre(line_msg, style={"fontSize":"12px","color":"#333","whiteSpace":"pre-wrap",
+                     "background":"#f5f5f3","borderRadius":"8px","padding":"10px 12px",
+                     "margin":"0 0 8px","fontFamily":"sans-serif","lineHeight":"1.6"}),
+            html.Button("📤 發送到 LINE", id="opt-line-btn", n_clicks=0,
+                        **{"data-msg": line_msg},
+                        style={"padding":"6px 16px","background":"#06c755","color":"#fff",
+                               "border":"none","borderRadius":"6px","cursor":"pointer","fontSize":"13px"}),
+            html.Div(id="opt-line-msg", style={"fontSize":"12px","color":"#0F6E56","marginTop":"6px"}),
+        ], style={"border":"0.5px solid #e5e5e5","borderRadius":"10px","padding":"12px 14px",
+                  "background":"white","marginBottom":"10px"})
+
+        return html.Div([spot_label, sug_box, line_preview, dual_box] + exp_cards)
+
+    except Exception as e:
+        return html.P(f"錯誤：{e}", style={"color":"#dc2626","fontSize":"13px"})
+
+
+@app.callback(
+    Output("opt-line-msg","children"),
+    Input("opt-line-btn","n_clicks"),
+    State("opt-line-btn","data-msg"),
+    prevent_initial_call=True,
+)
+def send_opt_line(n_clicks, msg):
+    if not n_clicks or not msg:
+        return ""
+    try:
+        send_line(msg)
+        return "✅ 已發送到 LINE"
+    except Exception as e:
+        return f"❌ 發送失敗：{e}"
+
+
 if __name__ == "__main__":
     t = threading.Thread(target=scheduler_loop, daemon=True)
     t.start()
@@ -2039,21 +3765,41 @@ if __name__ == "__main__":
 # ── 台股月K篩選 ───────────────────────────────────────────────
 
 # 台灣中型100成分股（2024年底版本，Yahoo Finance格式需加.TW）
-TW_MID100 = [
-    "2303","2308","2317","2324","2327","2328","2330","2331","2337","2347",
-    "2352","2353","2354","2356","2357","2360","2362","2363","2368","2371",
-    "2376","2377","2379","2382","2383","2385","2392","2395","2408","2409",
-    "2413","2414","2415","2421","2423","2426","2429","2441","2448","2449",
-    "2450","2451","2455","2456","2458","2460","2461","2474","2478","2481",
-    "2485","2488","2492","2496","2498","2501","2504","2511","2515","2520",
-    "2548","2603","2609","2615","2618","2633","2634","2636","2637","2641",
-    "2642","2645","2711","2727","2809","2812","2820","2823","2824","2832",
-    "2834","2836","2838","2845","2847","2849","2850","2851","2852","2855",
-    "2856","2880","2881","2882","2883","2884","2885","2886","2887","2888",
-    "2889","2890","2891","2892","2897","3034","3037","3044","3045","3149",
-    "3189","3653","4904","4938","4958","5871","5876","5880","6176","6214",
-    "6269","6278","6285","6414","6446","6669","6770","8088","8046","9910"
-]
+TW_MID100 = {
+    "2303":"聯電",    "2308":"台達電",  "2317":"鴻海",    "2324":"仁寶",
+    "2327":"國巨",    "2328":"廣宇",    "2330":"台積電",  "2331":"精英",
+    "2337":"旺宏",    "2347":"聯強",    "2352":"佳世達",  "2353":"宏碁",
+    "2354":"鴻準",    "2356":"英業達",  "2357":"華碩",    "2360":"致茂",
+    "2362":"藍天",    "2363":"擎華",    "2368":"金像電",  "2371":"大同",
+    "2376":"技嘉",    "2377":"微星",    "2379":"瑞昱",    "2382":"廣達",
+    "2383":"台光電",  "2385":"群光",    "2392":"正崴",    "2395":"研華",
+    "2408":"南亞科",  "2409":"友達",    "2413":"環科",    "2414":"精技",
+    "2415":"今國光",  "2421":"建準",    "2423":"固緯",    "2426":"鑫永銓",
+    "2429":"銘旺科",  "2441":"超豐",    "2448":"晶電",    "2449":"京元電子",
+    "2450":"神腦",    "2451":"創見",    "2455":"全新",    "2456":"奇力新",
+    "2458":"義隆",    "2460":"建通",    "2461":"光群雷",  "2474":"可成",
+    "2478":"大毅",    "2481":"強茂",    "2485":"兆赫",    "2488":"漢平",
+    "2492":"華新科",  "2496":"卓越",    "2498":"宏達電",  "2501":"國建",
+    "2504":"國產",    "2511":"太子",    "2515":"中工",    "2520":"冠德",
+    "2548":"華固",    "2603":"長榮",    "2609":"陽明",    "2615":"萬海",
+    "2618":"長榮航",  "2633":"台灣高鐵","2634":"漢翔",    "2636":"台驊",
+    "2637":"慧洋",    "2641":"正德",    "2642":"宅配通",  "2645":"大榮",
+    "2711":"晶華",    "2727":"王品",    "2809":"京城銀",  "2812":"台中銀",
+    "2820":"華票",    "2823":"中壽",    "2824":"山富",    "2832":"台產",
+    "2834":"臺企銀",  "2836":"遠東銀",  "2838":"聯邦銀",  "2845":"遠銀",
+    "2847":"大眾銀",  "2849":"安泰銀",  "2850":"新產",    "2851":"中再保",
+    "2852":"第一保",  "2855":"統一證",  "2856":"元富",    "2880":"華南金",
+    "2881":"富邦金",  "2882":"國泰金",  "2883":"開發金",  "2884":"玉山金",
+    "2885":"元大金",  "2886":"兆豐金",  "2887":"台新金",  "2888":"新光金",
+    "2889":"國票金",  "2890":"永豐金",  "2891":"中信金",  "2892":"第一金",
+    "2897":"王道銀",  "3034":"聯詠",    "3037":"欣興",    "3044":"健鼎",
+    "3045":"台灣大",  "3149":"正達",    "3189":"景碩",    "3653":"健策",
+    "4904":"遠傳",    "4938":"和碩",    "4958":"臻鼎-KY","5871":"中租-KY",
+    "5876":"上海商銀","5880":"合庫金",  "6176":"瑞儀",    "6214":"精誠",
+    "6269":"台郡",    "6278":"台表科",  "6285":"啟碁",    "6414":"樺漢",
+    "6446":"藥華藥",  "6669":"緯穎",    "6770":"力積電",  "8088":"品安",
+    "8046":"南電",    "9910":"豐泰",
+}
 
 @app.callback(
     Output("tw-screen-div","children"),
@@ -2081,7 +3827,8 @@ def update_tw_screen(n_clicks):
     total = len(TW_MID100)
     processed = 0
 
-    for code in TW_MID100:
+    for code in TW_MID100.keys():
+        name = TW_MID100.get(code, "")
         sym = f"{code}.TW"
         try:
             dates, closes, _, opens = fetch_yahoo_range(sym, start_dt, end_dt, "1mo")
@@ -2125,7 +3872,7 @@ def update_tw_screen(n_clicks):
             chg = round((last_close - prev_close) / prev_close * 100, 1) if prev_close else 0
 
             row = {
-                "code": code, "sym": sym,
+                "code": code, "name": name, "sym": sym,
                 "close": last_close, "open": last_open,
                 "prev_close": prev_close,
                 "ma5": round(ma5, 1) if ma5 else None,
@@ -2158,7 +3905,10 @@ def update_tw_screen(n_clicks):
         for r in rows:
             chg_color = "#0F6E56" if r["chg"]>=0 else "#A32D2D"
             trs.append(html.Tr([
-                html.Td(r["code"], style={"padding":"5px 10px","fontWeight":"500"}),
+                html.Td(html.Div([
+                    html.Span(r["code"], style={"fontWeight":"500"}),
+                    html.Span(f" {r.get('name','')}", style={"color":"#888","fontSize":"11px","marginLeft":"4px"}),
+                ]), style={"padding":"5px 10px","whiteSpace":"nowrap"}),
                 html.Td(f"{r['close']:.1f}", style={"padding":"5px 10px","textAlign":"right"}),
                 html.Td(f"{r['open']:.1f}",  style={"padding":"5px 10px","textAlign":"right"}),
                 html.Td(f"{r['prev_close']:.1f}", style={"padding":"5px 10px","textAlign":"right"}),
@@ -2174,7 +3924,7 @@ def update_tw_screen(n_clicks):
                             "padding":"10px 12px","borderBottom":"0.5px solid #eee"}),
             html.Div(html.Table([
                 html.Thead(html.Tr([
-                    html.Th("代號",style=th_l),
+                    html.Th("代號／名稱",style=th_l),
                     html.Th("6月收",style=th), html.Th("6月開",style=th),
                     html.Th("5月收",style=th), html.Th("5月均價",style={**th,"color":"#7c3aed"}),
                     html.Th("月漲幅",style=th), html.Th("K線",style=th),
