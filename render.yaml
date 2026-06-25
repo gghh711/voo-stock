@@ -1,7 +1,15 @@
 services:
   - type: web
-    name: stock-slope-chart
+    name: slope-dashboard
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:server -b 0.0.0.0:$PORT
-    plan: free
+    startCommand: python app.py
+    envVars:
+      - key: LINE_TOKEN
+        sync: false
+      - key: LINE_USER_ID
+        sync: false
+      - key: LINE_USER_ID2
+        sync: false
+      - key: FRED_API_KEY
+        sync: false
