@@ -1525,6 +1525,102 @@ def asia_slope_block(display, closes, window):
     extra = f"　{ret5_str}　｜　{nh_str}"
     return base + "\n" + extra
 
+def calc_option_confidence(all_puts, all_calls, exp_data, spot, dual_puts, dual_calls):
+    """
+    計算期權數據信心度
+    High  ：數據充足，Put/Call牆清晰，跨月雙重確認
+    Medium：數據充足但有大量部位流動跡象（OI 集中在單一履約價或 IV 偏高）
+    Low   ：數據不足、無雙重確認、或牆離現價過遠
+    """
+    score   = 0
+    reasons = []
+    warns   = []
+
+    # 1. 有效數據量
+    if len(all_puts) >= 5 and len(all_calls) >= 5:
+        score += 2
+    elif len(all_puts) >= 3 or len(all_calls) >= 3:
+        score += 1
+        warns.append("期權數據偏少")
+    else:
+        warns.append("期權數據嚴重不足")
+
+    # 2. 跨月雙重確認
+    if dual_puts:
+        score += 2
+        reasons.append(f"Put牆跨月確認 ${dual_puts[0][0]:.0f}")
+    else:
+        warns.append("Put牆無跨月確認")
+
+    if dual_calls:
+        score += 2
+        reasons.append(f"Call牆跨月確認 ${dual_calls[0][0]:.0f}")
+    else:
+        warns.append("Call牆無跨月確認")
+
+    # 3. 牆是否在合理範圍（現價 ±10%）
+    valid_sup = [k for k in all_puts  if spot * 0.90 <= k < spot]
+    valid_res = [k for k in all_calls if spot < k <= spot * 1.10]
+    if valid_sup:
+        score += 1
+        reasons.append("支撐位在合理範圍")
+    else:
+        warns.append("支撐位過遠或缺失")
+    if valid_res:
+        score += 1
+        reasons.append("阻力位在合理範圍")
+    else:
+        warns.append("阻力位過遠或缺失")
+
+    # 4. OI 是否過度集中（單一履約價 OI > 總 OI 的 60% → 大量部位流動跡象）
+    if all_puts:
+        max_put_oi   = max(all_puts.values())
+        total_put_oi = sum(all_puts.values())
+        if total_put_oi > 0 and max_put_oi / total_put_oi > 0.6:
+            score -= 1
+            warns.append("Put OI 過度集中，可能有大量部位流動")
+    if all_calls:
+        max_call_oi   = max(all_calls.values())
+        total_call_oi = sum(all_calls.values())
+        if total_call_oi > 0 and max_call_oi / total_call_oi > 0.6:
+            score -= 1
+            warns.append("Call OI 過度集中，可能有大量部位流動")
+
+    # 5. 到期日數量
+    if len(exp_data) >= 2:
+        score += 1
+        reasons.append("近月+次月數據完整")
+    else:
+        warns.append("只有單月數據")
+
+    # 判斷信心度
+    if score >= 7 and not warns:
+        level = "High"
+        label = "🟢 高（High）"
+        color = "#0F6E56"
+        note  = "數據充足，訊號可信"
+    elif score >= 4 or (score >= 3 and len(warns) <= 2):
+        level = "Medium"
+        label = "🟡 中（Medium）"
+        color = "#d97706"
+        note  = "數據基本充足，留意以下注意事項"
+    else:
+        level = "Low"
+        label = "🔴 低（Low）"
+        color = "#dc2626"
+        note  = "數據不足或異常，建議暫停使用期權指標"
+
+    return {
+        "level":   level,
+        "label":   label,
+        "color":   color,
+        "note":    note,
+        "score":   score,
+        "reasons": reasons,
+        "warns":   warns,
+    }
+
+
 def build_option_line_msg(ticker):
     """產生期權結構的 LINE 訊息文字"""
     try:
@@ -1547,6 +1643,13 @@ def build_option_line_msg(ticker):
                 chain = t.option_chain(e)
                 puts  = chain.puts[["strike","openInterest"]].dropna()
                 calls = chain.calls[["strike","openInterest"]].dropna()
+                # 過濾：OI > 100 且履約價在現價 ±15% 範圍內
+                puts  = puts[(puts["openInterest"] > 100) &
+                             (puts["strike"] >= spot * 0.85) &
+                             (puts["strike"] <= spot * 1.15)]
+                calls = calls[(calls["openInterest"] > 100) &
+                              (calls["strike"] >= spot * 0.85) &
+                              (calls["strike"] <= spot * 1.15)]
                 for _, row in puts.iterrows():
                     all_puts[row["strike"]]  = all_puts.get(row["strike"],0)  + row["openInterest"]
                 for _, row in calls.iterrows():
@@ -1601,6 +1704,12 @@ def build_option_line_msg(ticker):
         dual_puts  = [(k,v) for k,v in [(k,all_puts[k])  for k in top_put_strikes  if k<spot]  if dual(k,"put")]  if exp_data else []
         dual_calls = [(k,v) for k,v in [(k,all_calls[k]) for k in top_call_strikes if k>spot] if dual(k,"call")] if exp_data else []
 
+        # 信心度
+        conf = calc_option_confidence(all_puts, all_calls, exp_data, spot, dual_puts, dual_calls)
+        conf_line = f"📊 資料信心度：{conf['label']}（{conf['note']}）"
+        if conf["warns"]:
+            conf_line += "\n   ⚠️ " + "　".join(conf["warns"])
+
         put_str  = "　".join([f"${k:.0f}(✅雙月)" for k,v in dual_puts[:2]]  or [f"${k:.0f}" for k,v in support[:2]])
         call_str = "　".join([f"${k:.0f}(✅雙月)" for k,v in dual_calls[:2]] or [f"${k:.0f}" for k,v in resist[:2]])
 
@@ -1613,6 +1722,7 @@ def build_option_line_msg(ticker):
         msg = (f"【⚡ {ticker} 期權結構】\n{tw_time}\n\n"
                f"📍 現價：${spot:.2f}\n"
                f"{sug}\n\n"
+               f"{conf_line}\n\n"
                f"🔗 Put牆：{put_str or '—'}\n"
                f"🔗 Call牆：{call_str or '—'}\n")
         if put_note:  msg += f"{put_note}\n"
@@ -3566,6 +3676,14 @@ def update_options(n_clicks, ticker_input):
                 puts  = chain.puts[["strike","openInterest","impliedVolatility"]].dropna()
                 calls = chain.calls[["strike","openInterest","impliedVolatility"]].dropna()
 
+                # 過濾：OI > 100 且履約價在現價 ±15% 範圍內
+                puts  = puts[(puts["openInterest"] > 100) &
+                             (puts["strike"] >= spot * 0.85) &
+                             (puts["strike"] <= spot * 1.15)]
+                calls = calls[(calls["openInterest"] > 100) &
+                              (calls["strike"] >= spot * 0.85) &
+                              (calls["strike"] <= spot * 1.15)]
+
                 # 累加跨月OI
                 for _, row in puts.iterrows():
                     all_puts[row["strike"]]  = all_puts.get(row["strike"], 0)  + row["openInterest"]
@@ -3604,6 +3722,20 @@ def update_options(n_clicks, ticker_input):
             return html.P("期權數據解析失敗", style={"color":"#aaa","fontSize":"13px"})
 
         # 跨月雙重確認的強支撐/強阻力
+        # 資料品質檢查
+        if len(all_puts) < 3 and len(all_calls) < 3:
+            return html.Div([
+                html.P("⚠️ 期權數據品質不佳",
+                       style={"color":"#d97706","fontSize":"14px","fontWeight":"500"}),
+                html.P(f"現價 ${spot:.2f} 附近（±15%）的有效 OI 數據不足，可能原因：",
+                       style={"color":"#888","fontSize":"13px"}),
+                html.Ul([
+                    html.Li("yfinance 數據延遲或不完整"),
+                    html.Li("今日為結算日，合約剛到期"),
+                    html.Li("建議明天盤中（台灣時間晚上10點後）再試"),
+                ], style={"fontSize":"12px","color":"#888"}),
+            ])
+
         top_put_strikes  = sorted(all_puts,  key=lambda k: all_puts[k],  reverse=True)[:5]
         top_call_strikes = sorted(all_calls, key=lambda k: all_calls[k], reverse=True)[:5]
 
@@ -3667,13 +3799,20 @@ def update_options(n_clicks, ticker_input):
         dual_puts  = [(k, all_puts[k])  for k in top_put_strikes  if dual_confirm(k, exp_data,"put")]
         dual_calls = [(k, all_calls[k]) for k in top_call_strikes if dual_confirm(k, exp_data,"call")]
 
+        # 信心度
+        conf = calc_option_confidence(all_puts, all_calls, exp_data, spot, dual_puts, dual_calls)
+
         top_put_str  = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_puts or support_strikes)[:2]])
         top_call_str = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_calls or resist_strikes)[:2]])
+
+        conf_line_msg = f"📊 信心度：{conf['label']}（{conf['note']}）"
+        if conf["warns"]: conf_line_msg += "\n   ⚠️ " + "　".join(conf["warns"])
 
         line_msg = (
             f"【⚡ {ticker} 期權結構】\n{tw_time}\n\n"
             f"📍 現價：${spot:.2f}\n"
             f"{sug_icon} {sug_text}\n\n"
+            f"{conf_line_msg}\n\n"
             f"🔗 Put牆（支撐）：{top_put_str or '—'}\n"
             f"🔗 Call牆（阻力）：{top_call_str or '—'}\n"
         )
@@ -3755,6 +3894,20 @@ def update_options(n_clicks, ticker_input):
             for s in suggestions
         ])
 
+        conf_card = html.Div([
+            html.Div([
+                html.Span("📊 資料信心度：", style={"fontSize":"12px","color":"#888"}),
+                html.Span(conf["label"], style={"fontSize":"14px","fontWeight":"500","color":conf["color"]}),
+            ], style={"marginBottom":"6px"}),
+            html.Div(conf["note"], style={"fontSize":"12px","color":conf["color"],"marginBottom":"6px"}),
+            html.Div([
+                *[html.Div(f"✅ {r}", style={"fontSize":"11px","color":"#0F6E56"}) for r in conf["reasons"]],
+                *[html.Div(f"⚠️ {w}", style={"fontSize":"11px","color":"#d97706"}) for w in conf["warns"]],
+            ]),
+        ], style={"background": "#f0faf5" if conf["level"]=="High" else "#fffbeb" if conf["level"]=="Medium" else "#fff5f5",
+                  "border":f"1.5px solid {conf['color']}","borderRadius":"10px",
+                  "padding":"10px 14px","marginBottom":"10px"})
+
         spot_label = html.Div(
             f"📍 {ticker} 現價：${spot:.2f}",
             style={"fontSize":"14px","fontWeight":"500","color":"#1a1a1a","marginBottom":"12px"})
@@ -3773,7 +3926,7 @@ def update_options(n_clicks, ticker_input):
         ], style={"border":"0.5px solid #e5e5e5","borderRadius":"10px","padding":"12px 14px",
                   "background":"white","marginBottom":"10px"})
 
-        return html.Div([spot_label, sug_box, line_preview, dual_box] + exp_cards)
+        return html.Div([spot_label, conf_card, sug_box, line_preview, dual_box] + exp_cards)
 
     except Exception as e:
         return html.P(f"錯誤：{e}", style={"color":"#dc2626","fontSize":"13px"})
