@@ -3634,49 +3634,52 @@ def update_options(n_clicks, ticker_input):
         import yfinance as yf
         import math as _math
 
-        t       = yf.Ticker(ticker)
-        spot    = t.fast_info.get("lastPrice") or t.fast_info.last_price
-        exps    = t.options
+        t    = yf.Ticker(ticker)
+        spot = t.fast_info.get("lastPrice") or t.fast_info.last_price
+        exps = t.options
         if not exps:
             return html.P("無法取得期權數據", style={"color":"#aaa","fontSize":"13px"})
 
-        today   = datetime.date.today()
+        today = datetime.date.today()
 
-        # 找最近4個有效到期日（跳過今天到期或已過期）
-        exp_dates = []
-        for e in exps[:8]:
-            ed = datetime.date.fromisoformat(e)
-            if ed <= today:
-                continue  # 跳過今天及已過期
-            exp_dates.append((e, ed, (ed - today).days))
+        # ── Step 1：DTE 分類 ──
+        def dte_category(days):
+            if days == 0:  return "0DTE"
+            if days <= 7:  return "Weekly"
+            if days <= 60: return "Monthly"
+            return "LEAPS"
 
-        if not exp_dates:
+        # 收集所有有效到期日（跳過今天/過期）
+        all_exps = []
+        for e in exps:
+            ed   = datetime.date.fromisoformat(e)
+            days = (ed - today).days
+            if days <= 0: continue
+            all_exps.append({"exp": e, "ed": ed, "days": days,
+                             "cat": dte_category(days),
+                             "is_gamma": ed.weekday() in [2,4],
+                             "is_opex":  ed.weekday() == 4})
+
+        if not all_exps:
             return html.P("目前無有效期權到期日（今日結算日，請明天再查）",
                           style={"color":"#d97706","fontSize":"13px"})
 
-        # 抓近月和次月
-        near_exps  = exp_dates[:2]
-
-        # 結算日判斷（週五=4，週三=2）
-        settle_flags = []
-        for e, ed, days in near_exps:
-            dow = ed.weekday()
-            is_opex = (dow == 4)        # 月度結算通常是週五
-            is_gamma = (dow in [2,4])   # 週三/週五 Gamma 影響大
-            settle_flags.append((e, ed, days, is_opex, is_gamma))
-
-        # 彙整各到期日的Put/Call牆
-        all_puts  = {}  # strike → total OI
-        all_calls = {}
+        # ── Step 2：擷取 + 過濾 + 計算 ──
+        ALL_PUTS  = {}  # strike → {cat: weighted_oi}
+        ALL_CALLS = {}
         exp_data  = []
+        short_term_count = 0  # 0DTE + Weekly 合約數
 
-        for e, ed, days, is_opex, is_gamma in settle_flags:
+        for exp_info in all_exps[:6]:  # 最多抓6個到期日
+            e    = exp_info["exp"]
+            days = exp_info["days"]
+            cat  = exp_info["cat"]
             try:
                 chain = t.option_chain(e)
                 puts  = chain.puts[["strike","openInterest","impliedVolatility"]].dropna()
                 calls = chain.calls[["strike","openInterest","impliedVolatility"]].dropna()
 
-                # 過濾：OI > 100 且履約價在現價 ±15% 範圍內
+                # 過濾：OI > 100 且 ±15% 範圍
                 puts  = puts[(puts["openInterest"] > 100) &
                              (puts["strike"] >= spot * 0.85) &
                              (puts["strike"] <= spot * 1.15)]
@@ -3684,237 +3687,219 @@ def update_options(n_clicks, ticker_input):
                               (calls["strike"] >= spot * 0.85) &
                               (calls["strike"] <= spot * 1.15)]
 
-                # 累加跨月OI
-                for _, row in puts.iterrows():
-                    all_puts[row["strike"]]  = all_puts.get(row["strike"], 0)  + row["openInterest"]
-                for _, row in calls.iterrows():
-                    all_calls[row["strike"]] = all_calls.get(row["strike"], 0) + row["openInterest"]
+                if cat in ("0DTE","Weekly"):
+                    short_term_count += len(puts) + len(calls)
 
-                # 計算Gamma Exposure（近似：Gamma ≈ OI × 100 × spot × IV / sqrt(T) × 0.01）
+                # 加權 OI（LEAPS 權重 0.5，其他全重）
+                weight = 0.5 if cat == "LEAPS" else 1.0
                 T = max(days/365, 1/365)
-                def approx_gamma_exp(df, is_put=False):
-                    gex = 0
-                    for _, row in df.iterrows():
-                        iv = row["impliedVolatility"]
-                        oi = row["openInterest"]
-                        k  = row["strike"]
-                        if iv > 0 and oi > 0:
-                            d1 = (_math.log(spot/k) + 0.5*iv*iv*T) / (iv*_math.sqrt(T))
-                            gamma = _math.exp(-d1*d1/2) / (spot * iv * _math.sqrt(2*_math.pi*T))
-                            g = gamma * oi * 100 * spot * spot * 0.01
-                            gex += (-g if is_put else g)
-                    return gex
 
-                gex_call = approx_gamma_exp(calls, is_put=False)
-                gex_put  = approx_gamma_exp(puts,  is_put=True)
+                for _, row in puts.iterrows():
+                    k  = row["strike"]
+                    oi = row["openInterest"] * weight
+                    iv = row["impliedVolatility"]
+                    ALL_PUTS.setdefault(k, {"oi":0,"gex":0})
+                    ALL_PUTS[k]["oi"] += oi
+                    # Gamma
+                    if iv > 0:
+                        try:
+                            d1    = (_math.log(spot/k) + 0.5*iv*iv*T) / (iv*_math.sqrt(T))
+                            gamma = _math.exp(-d1*d1/2) / (spot*iv*_math.sqrt(2*_math.pi*T))
+                            ALL_PUTS[k]["gex"] -= gamma * oi * 100 * spot * spot * 0.01
+                        except: pass
 
-                exp_data.append({
-                    "exp": e, "days": days,
-                    "is_opex": is_opex, "is_gamma": is_gamma,
+                for _, row in calls.iterrows():
+                    k  = row["strike"]
+                    oi = row["openInterest"] * weight
+                    iv = row["impliedVolatility"]
+                    ALL_CALLS.setdefault(k, {"oi":0,"gex":0})
+                    ALL_CALLS[k]["oi"] += oi
+                    if iv > 0:
+                        try:
+                            d1    = (_math.log(spot/k) + 0.5*iv*iv*T) / (iv*_math.sqrt(T))
+                            gamma = _math.exp(-d1*d1/2) / (spot*iv*_math.sqrt(2*_math.pi*T))
+                            ALL_CALLS[k]["gex"] += gamma * oi * 100 * spot * spot * 0.01
+                        except: pass
+
+                exp_data.append({**exp_info,
                     "top_puts":  puts.nlargest(5,"openInterest")[["strike","openInterest"]].values.tolist(),
                     "top_calls": calls.nlargest(5,"openInterest")[["strike","openInterest"]].values.tolist(),
-                    "gex_net": round((gex_call + gex_put)/1e6, 1),
+                    "put_count": len(puts), "call_count": len(calls),
                 })
-            except:
-                continue
+            except: continue
 
-        if not exp_data:
-            return html.P("期權數據解析失敗", style={"color":"#aaa","fontSize":"13px"})
+        # ── Step 3：警示 ──
+        warning_msg = None
+        if short_term_count < 5:
+            warning_msg = ("⚠️ 短期合約（0DTE/Weekly）數據不足（僅 " + str(short_term_count) + " 筆），"
+                           "期權結構分析可信度低，建議改參考技術面指標（斜率/均線）而非期權支撐阻力。")
 
-        # 跨月雙重確認的強支撐/強阻力
-        # 資料品質檢查
-        if len(all_puts) < 3 and len(all_calls) < 3:
-            return html.Div([
-                html.P("⚠️ 期權數據品質不佳",
-                       style={"color":"#d97706","fontSize":"14px","fontWeight":"500"}),
-                html.P(f"現價 ${spot:.2f} 附近（±15%）的有效 OI 數據不足，可能原因：",
-                       style={"color":"#888","fontSize":"13px"}),
-                html.Ul([
-                    html.Li("yfinance 數據延遲或不完整"),
-                    html.Li("今日為結算日，合約剛到期"),
-                    html.Li("建議明天盤中（台灣時間晚上10點後）再試"),
-                ], style={"fontSize":"12px","color":"#888"}),
-            ])
-
-        top_put_strikes  = sorted(all_puts,  key=lambda k: all_puts[k],  reverse=True)[:5]
-        top_call_strikes = sorted(all_calls, key=lambda k: all_calls[k], reverse=True)[:5]
-
-        # 找最強支撐（最大Put OI且低於現價）和最強阻力（最大Call OI且高於現價）
-        support_strikes  = [(k, all_puts[k])  for k in top_put_strikes  if k < spot]
-        resist_strikes   = [(k, all_calls[k]) for k in top_call_strikes if k > spot]
-
-        main_support = support_strikes[0]  if support_strikes  else None
-        main_resist  = resist_strikes[0]   if resist_strikes   else None
+        # ── Step 4：Put/Call 牆 ──
+        top_put_strikes  = sorted(ALL_PUTS,  key=lambda k: ALL_PUTS[k]["oi"],  reverse=True)[:5]
+        top_call_strikes = sorted(ALL_CALLS, key=lambda k: ALL_CALLS[k]["oi"], reverse=True)[:5]
+        support_strikes  = [(k, ALL_PUTS[k]["oi"])  for k in top_put_strikes  if k < spot]
+        resist_strikes   = [(k, ALL_CALLS[k]["oi"]) for k in top_call_strikes if k > spot]
+        main_sup = support_strikes[0] if support_strikes else None
+        main_res = resist_strikes[0]  if resist_strikes  else None
 
         # 跨月雙重確認
-        def dual_confirm(strike, exp_data_list, side="put"):
-            count = 0
-            for ed in exp_data_list:
-                key = "top_puts" if side=="put" else "top_calls"
-                strikes_in_exp = [r[0] for r in ed[key]]
-                if strike in strikes_in_exp:
-                    count += 1
-            return count >= 2
+        def dual_confirm(strike, side):
+            key = "top_puts" if side=="put" else "top_calls"
+            return sum(1 for ed2 in exp_data if strike in [r[0] for r in ed2[key]]) >= 2
 
-        # ── 建議 ──
-        suggestions = []
-        if main_support and main_resist:
-            s_k, s_oi = main_support
-            r_k, r_oi = main_resist
-            s_dual = dual_confirm(s_k, exp_data, "put")
-            r_dual = dual_confirm(r_k, exp_data, "call")
+        dual_puts  = [(k, ALL_PUTS[k]["oi"])  for k in top_put_strikes  if k < spot and dual_confirm(k,"put")]
+        dual_calls = [(k, ALL_CALLS[k]["oi"]) for k in top_call_strikes if k > spot and dual_confirm(k,"call")]
 
-            dist_to_support = round((spot - s_k) / spot * 100, 1)
-            dist_to_resist  = round((r_k - spot) / spot * 100, 1)
+        # ── Step 5：信心度 ──
+        conf = calc_option_confidence(
+            {k: ALL_PUTS[k]["oi"]  for k in ALL_PUTS},
+            {k: ALL_CALLS[k]["oi"] for k in ALL_CALLS},
+            exp_data, spot, dual_puts, dual_calls)
+        if warning_msg:
+            conf["level"] = "Low"
+            conf["label"] = "🔴 低（Low）"
+            conf["color"] = "#dc2626"
+            conf["note"]  = "短期合約不足，建議改用技術面"
+            conf["warns"].insert(0, f"0DTE/Weekly 合約僅 {short_term_count} 筆")
 
-            if dist_to_support <= 2:
-                suggestions.append(("🟢 接近支撐位", f"現價 ${spot:.2f} 距 Put牆 ${s_k} 只有 {dist_to_support}%，可考慮買入", "buy"))
-            elif dist_to_resist <= 2:
-                suggestions.append(("🔴 接近阻力位", f"現價 ${spot:.2f} 距 Call牆 ${r_k} 只有 {dist_to_resist}%，可考慮減倉", "sell"))
-            else:
-                suggestions.append(("⚪ 區間中段", f"現價 ${spot:.2f}，支撐 ${s_k}（-{dist_to_support}%），阻力 ${r_k}（+{dist_to_resist}%）", "neutral"))
+        # ── Step 6：買賣建議 ──
+        if main_sup and main_res:
+            d_sup = (spot - main_sup[0]) / spot * 100
+            d_res = (main_res[0] - spot)  / spot * 100
+            if d_sup <= 2:   sug_icon,sug_text = "🟢","接近支撐！可考慮買入"
+            elif d_res <= 2: sug_icon,sug_text = "🔴","接近阻力！可考慮減倉"
+            else:             sug_icon,sug_text = "⚪",f"區間中段　支撐 ${main_sup[0]:.0f}（-{d_sup:.1f}%）　阻力 ${main_res[0]:.0f}（+{d_res:.1f}%）"
+        elif main_sup: sug_icon,sug_text = "⚪", f"支撐 ${main_sup[0]:.0f}，暫無明顯上方阻力"
+        elif main_res: sug_icon,sug_text = "⚪", f"阻力 ${main_res[0]:.0f}，暫無明顯下方支撐"
+        else:          sug_icon,sug_text = "⚪", "數據不足，無法判斷支撐阻力"
 
-        # 追蹤 Put/Call 牆歷史移動
+        # ── Step 7：歷史追蹤 ──
+        tw_time   = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
         put_note, call_note = track_option_wall(
-            ticker,
-            main_support[0] if main_support else 0,
-            main_resist[0]  if main_resist  else 0)
+            ticker, main_sup[0] if main_sup else 0, main_res[0] if main_res else 0)
 
-        # ── LINE 訊息格式 ──
-        tw_time = datetime.datetime.now(
-            datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-
-        sug_text = suggestions[0][1] if suggestions else "區間中段，觀察方向"
-        sug_icon = suggestions[0][0] if suggestions else "⚪"
-
-        next_exp = exp_data[0] if exp_data else None
+        near_exp = next((e for e in exp_data if e["cat"] in ("0DTE","Weekly","Monthly")), None)
         exp_line = ""
-        if next_exp:
-            gamma_tag = "⚠️ Gamma高峰" if next_exp["is_gamma"] else ""
-            opex_tag  = "📅 月結算" if next_exp["is_opex"] else ""
-            exp_line  = (f"📅 結算日 {next_exp['exp']}（{next_exp['days']}天後）"
-                        f"{'　'+gamma_tag if gamma_tag else ''}{'　'+opex_tag if opex_tag else ''}")
+        if near_exp:
+            tags = ("⚠️Gamma高峰" if near_exp["is_gamma"] else "")+("　📅月結算" if near_exp["is_opex"] else "")
+            exp_line = f"📅 結算日 {near_exp['exp']}（{near_exp['days']}天後）{tags}"
 
-        # 跨月雙重確認（提前計算，供 LINE 訊息和 UI 使用）
-        dual_puts  = [(k, all_puts[k])  for k in top_put_strikes  if dual_confirm(k, exp_data,"put")]
-        dual_calls = [(k, all_calls[k]) for k in top_call_strikes if dual_confirm(k, exp_data,"call")]
+        # ── Step 8：Gamma 分佈圖 ──
+        all_strikes = sorted(set(list(ALL_PUTS.keys()) + list(ALL_CALLS.keys())))
+        gamma_vals  = [ALL_CALLS.get(k,{}).get("gex",0) + ALL_PUTS.get(k,{}).get("gex",0)
+                       for k in all_strikes]
+        put_oi_vals  = [-ALL_PUTS.get(k,{}).get("oi",0)  for k in all_strikes]
+        call_oi_vals = [ ALL_CALLS.get(k,{}).get("oi",0) for k in all_strikes]
 
-        # 信心度
-        conf = calc_option_confidence(all_puts, all_calls, exp_data, spot, dual_puts, dual_calls)
+        fig_gamma = go.Figure()
+        fig_gamma.add_trace(go.Bar(x=all_strikes, y=call_oi_vals, name="Call OI",
+            marker_color="rgba(220,72,61,0.6)",
+            hovertemplate="履約價 $%{x}<br>Call OI: %{y:,.0f}<extra></extra>"))
+        fig_gamma.add_trace(go.Bar(x=all_strikes, y=put_oi_vals,  name="Put OI",
+            marker_color="rgba(34,160,107,0.6)",
+            hovertemplate="履約價 $%{x}<br>Put OI: %{y:,.0f}<extra></extra>"))
+        fig_gamma.add_trace(go.Scatter(x=all_strikes, y=gamma_vals, name="Net GEX",
+            mode="lines+markers", yaxis="y2",
+            line=dict(color="#7c3aed", width=2),
+            hovertemplate="履約價 $%{x}<br>GEX: %{y:.1f}M<extra></extra>"))
+        fig_gamma.add_vline(x=spot, line_color="#1a1a1a", line_dash="dash",
+                             line_width=1.5, annotation_text=f"現價 ${spot:.0f}",
+                             annotation_position="top")
+        fig_gamma.update_layout(
+            title=dict(text=f"{ticker} Gamma 分佈（OI + Net GEX）", font=dict(size=12), x=0),
+            barmode="overlay", hovermode="x unified",
+            plot_bgcolor="white", paper_bgcolor="white",
+            legend=dict(orientation="h", y=1.1, x=1, xanchor="right", font=dict(size=11)),
+            margin=dict(l=55,r=65,t=45,b=40),
+            height=280,
+            xaxis=dict(showgrid=True,gridcolor="#eee",title="履約價"),
+            yaxis=dict(title="OI",showgrid=True,gridcolor="#eee"),
+            yaxis2=dict(title="Net GEX(M)",overlaying="y",side="right",showgrid=False,
+                        zeroline=True,zerolinecolor="#ddd",
+                        tickfont=dict(color="#7c3aed"),title_font=dict(color="#7c3aed")))
 
-        top_put_str  = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_puts or support_strikes)[:2]])
-        top_call_str = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_calls or resist_strikes)[:2]])
-
-        conf_line_msg = f"📊 信心度：{conf['label']}（{conf['note']}）"
-        if conf["warns"]: conf_line_msg += "\n   ⚠️ " + "　".join(conf["warns"])
-
-        line_msg = (
-            f"【⚡ {ticker} 期權結構】\n{tw_time}\n\n"
-            f"📍 現價：${spot:.2f}\n"
-            f"{sug_icon} {sug_text}\n\n"
-            f"{conf_line_msg}\n\n"
-            f"🔗 Put牆（支撐）：{top_put_str or '—'}\n"
-            f"🔗 Call牆（阻力）：{top_call_str or '—'}\n"
-        )
-        if put_note:  line_msg += f"{put_note}\n"
-        if call_note: line_msg += f"{call_note}\n"
-        if exp_line:  line_msg += f"\n{exp_line}"
-
-        # ── UI ──
-        def oi_bar(oi, max_oi):
-            pct = min(oi / max_oi * 100, 100) if max_oi > 0 else 0
-            return html.Div(style={"background":"#e5e7eb","borderRadius":"3px","height":"6px","width":"80px","display":"inline-block","verticalAlign":"middle","marginLeft":"6px","overflow":"hidden"},
-                            children=[html.Div(style={"background":"#7c3aed","width":f"{pct}%","height":"100%","borderRadius":"3px"})])
-
-        # 到期日卡片
-        exp_cards = []
-        for ed in exp_data:
-            gamma_flag = "⚠️ Gamma高峰日" if ed["is_gamma"] else ""
-            opex_flag  = "📅 月結算日" if ed["is_opex"] else ""
-            exp_cards.append(html.Div([
-                html.Div([
-                    html.Span(ed["exp"], style={"fontWeight":"500","fontSize":"13px"}),
-                    html.Span(f"  {ed['days']}天後", style={"fontSize":"11px","color":"#aaa","marginLeft":"6px"}),
-                    html.Span(f"  {opex_flag} {gamma_flag}", style={"fontSize":"11px","color":"#d97706","marginLeft":"6px"}),
-                ], style={"marginBottom":"6px"}),
-                html.Div([
-                    html.Div([
-                        html.Div("Put牆（支撐）", style={"fontSize":"10px","color":"#0F6E56","marginBottom":"3px","fontWeight":"500"}),
-                        *[html.Div([
-                            html.Span(f"${r[0]:.0f}", style={"fontSize":"12px","fontWeight":"500"}),
-                            html.Span(f"  OI {r[1]:,.0f}", style={"fontSize":"11px","color":"#888"}),
-                            oi_bar(r[1], ed["top_puts"][0][1] if ed["top_puts"] else 1),
-                        ], style={"marginBottom":"2px"}) for r in ed["top_puts"][:3]],
-                    ], style={"flex":"1"}),
-                    html.Div([
-                        html.Div("Call牆（阻力）", style={"fontSize":"10px","color":"#A32D2D","marginBottom":"3px","fontWeight":"500"}),
-                        *[html.Div([
-                            html.Span(f"${r[0]:.0f}", style={"fontSize":"12px","fontWeight":"500"}),
-                            html.Span(f"  OI {r[1]:,.0f}", style={"fontSize":"11px","color":"#888"}),
-                            oi_bar(r[1], ed["top_calls"][0][1] if ed["top_calls"] else 1),
-                        ], style={"marginBottom":"2px"}) for r in ed["top_calls"][:3]],
-                    ], style={"flex":"1"}),
-                ], style={"display":"flex","gap":"16px"}),
-                html.Div(f"Net GEX：{ed['gex_net']:+.1f}M　{'正GEX→做市商賣Gamma，價格被磁吸穩定' if ed['gex_net']>0 else '負GEX→做市商買Gamma，波動放大'}",
-                         style={"fontSize":"11px","color":"#7c3aed","marginTop":"6px"}),
-            ], style={"background":"white","borderRadius":"10px","padding":"12px 14px",
-                      "border":"0.5px solid #e5e5e5","marginBottom":"10px"}))
-
-        # 跨月雙重確認 UI
-        max_put_oi  = max(all_puts.values())  if all_puts  else 1
-        max_call_oi = max(all_calls.values()) if all_calls else 1
-
-        dual_box = html.Div([
-            html.Div("🔗 跨月雙重確認（近月+次月同時存在 → 訊號更強）",
-                     style={"fontSize":"12px","fontWeight":"500","color":"#1a1a1a","marginBottom":"8px"}),
+        # ── UI 組件 ──
+        # DTE 分類摘要
+        dte_summary = {}
+        for e in exp_data:
+            cat = e["cat"]
+            dte_summary[cat] = dte_summary.get(cat, 0) + e["put_count"] + e["call_count"]
+        dte_cards = html.Div([
             html.Div([
-                html.Div([
-                    html.Div("✅ 強支撐（雙月Put牆）", style={"fontSize":"11px","color":"#0F6E56","marginBottom":"4px"}),
-                ] + ([html.Div(f"${k:.0f}　累計OI {oi:,.0f}", style={"fontSize":"12px","fontWeight":"500","color":"#0F6E56"})
-                      for k,oi in dual_puts[:3]] or [html.Div("無", style={"fontSize":"11px","color":"#aaa"})]),
-                style={"flex":"1"}),
-                html.Div([
-                    html.Div("🚫 強阻力（雙月Call牆）", style={"fontSize":"11px","color":"#A32D2D","marginBottom":"4px"}),
-                ] + ([html.Div(f"${k:.0f}　累計OI {oi:,.0f}", style={"fontSize":"12px","fontWeight":"500","color":"#A32D2D"})
-                      for k,oi in dual_calls[:3]] or [html.Div("無", style={"fontSize":"11px","color":"#aaa"})]),
-                style={"flex":"1"}),
-            ], style={"display":"flex","gap":"16px"}),
-        ], style={"background":"#f5f5f3","borderRadius":"10px","padding":"12px 14px","marginBottom":"10px"})
+                html.Div(cat, style={"fontSize":"10px","color":"#aaa"}),
+                html.Div(f"{cnt} 筆", style={"fontSize":"13px","fontWeight":"500",
+                         "color":"#dc2626" if cat=="0DTE" else "#d97706" if cat=="Weekly"
+                                else "#2563eb" if cat=="Monthly" else "#888"}),
+            ], style={"textAlign":"center","background":"#f5f5f3","borderRadius":"6px",
+                      "padding":"6px 10px","flex":"1"})
+            for cat, cnt in dte_summary.items()
+        ], style={"display":"flex","gap":"6px","marginBottom":"10px"})
 
-        # 買賣建議
-        sug_color = {"buy":"#0F6E56","sell":"#A32D2D","neutral":"#888"}
-        sug_bg    = {"buy":"#f0faf5","sell":"#fff5f5","neutral":"#f5f5f3"}
-        sug_box   = html.Div([
-            html.Div([
-                html.Div(s[0], style={"fontSize":"14px","fontWeight":"500",
-                                      "color":sug_color[s[2]]}),
-                html.Div(s[1], style={"fontSize":"12px","color":"#555","marginTop":"3px"}),
-            ], style={"background":sug_bg[s[2]],"borderRadius":"10px","padding":"12px 16px",
-                      "border":f"1.5px solid {sug_color[s[2]]}","marginBottom":"8px"})
-            for s in suggestions
-        ])
+        # 警示框
+        warn_box = html.Div()
+        if warning_msg:
+            warn_box = html.Div(warning_msg,
+                style={"background":"#fff5f5","border":"1.5px solid #dc2626","borderRadius":"8px",
+                       "padding":"10px 14px","fontSize":"12px","color":"#dc2626","marginBottom":"10px"})
 
+        # 信心度卡
         conf_card = html.Div([
             html.Div([
                 html.Span("📊 資料信心度：", style={"fontSize":"12px","color":"#888"}),
                 html.Span(conf["label"], style={"fontSize":"14px","fontWeight":"500","color":conf["color"]}),
             ], style={"marginBottom":"6px"}),
-            html.Div(conf["note"], style={"fontSize":"12px","color":conf["color"],"marginBottom":"6px"}),
+            html.Div(conf["note"], style={"fontSize":"12px","color":conf["color"],"marginBottom":"4px"}),
             html.Div([
                 *[html.Div(f"✅ {r}", style={"fontSize":"11px","color":"#0F6E56"}) for r in conf["reasons"]],
                 *[html.Div(f"⚠️ {w}", style={"fontSize":"11px","color":"#d97706"}) for w in conf["warns"]],
             ]),
-        ], style={"background": "#f0faf5" if conf["level"]=="High" else "#fffbeb" if conf["level"]=="Medium" else "#fff5f5",
+        ], style={"background":"#f0faf5" if conf["level"]=="High" else "#fffbeb" if conf["level"]=="Medium" else "#fff5f5",
                   "border":f"1.5px solid {conf['color']}","borderRadius":"10px",
                   "padding":"10px 14px","marginBottom":"10px"})
 
-        spot_label = html.Div(
-            f"📍 {ticker} 現價：${spot:.2f}",
-            style={"fontSize":"14px","fontWeight":"500","color":"#1a1a1a","marginBottom":"12px"})
+        # 買賣建議
+        sug_color = {"🟢":"#0F6E56","🔴":"#A32D2D","⚪":"#888"}[sug_icon]
+        sug_box = html.Div([
+            html.Div(f"{sug_icon} {sug_text}",
+                     style={"fontSize":"14px","fontWeight":"500","color":sug_color}),
+        ], style={"background":"#f0faf5" if sug_icon=="🟢" else "#fff5f5" if sug_icon=="🔴" else "#f5f5f3",
+                  "borderRadius":"10px","padding":"12px 16px","marginBottom":"10px",
+                  "border":f"1.5px solid {sug_color}"})
+
+        # 跨月雙重確認
+        dual_box = html.Div([
+            html.Div("🔗 跨月雙重確認", style={"fontSize":"12px","fontWeight":"500","marginBottom":"8px"}),
+            html.Div([
+                html.Div([
+                    html.Div("✅ 強支撐（雙月Put牆）",style={"fontSize":"11px","color":"#0F6E56","marginBottom":"4px"}),
+                ] + ([html.Div(f"${k:.0f}　累計OI {oi:,.0f}", style={"fontSize":"12px","fontWeight":"500","color":"#0F6E56"})
+                      for k,oi in dual_puts[:3]] or [html.Div("無",style={"fontSize":"11px","color":"#aaa"})]),
+                style={"flex":"1"}),
+                html.Div([
+                    html.Div("🚫 強阻力（雙月Call牆）",style={"fontSize":"11px","color":"#A32D2D","marginBottom":"4px"}),
+                ] + ([html.Div(f"${k:.0f}　累計OI {oi:,.0f}", style={"fontSize":"12px","fontWeight":"500","color":"#A32D2D"})
+                      for k,oi in dual_calls[:3]] or [html.Div("無",style={"fontSize":"11px","color":"#aaa"})]),
+                style={"flex":"1"}),
+            ], style={"display":"flex","gap":"16px"}),
+        ], style={"background":"#f5f5f3","borderRadius":"10px","padding":"12px 14px","marginBottom":"10px"})
+
+        # LINE 訊息預覽
+        top_put_str  = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_puts or support_strikes)[:2]])
+        top_call_str = "　".join([f"${k:.0f}(OI {oi/1000:.0f}k)" for k,oi in (dual_calls or resist_strikes)[:2]])
+        conf_line_msg = f"📊 信心度：{conf['label']}（{conf['note']}）"
+        if conf["warns"]: conf_line_msg += "\n   ⚠️ " + "　".join(conf["warns"])
+        line_msg = (f"【⚡ {ticker} 期權結構】\n{tw_time}\n\n"
+                    f"📍 現價：${spot:.2f}\n"
+                    f"{sug_icon} {sug_text}\n\n"
+                    f"{conf_line_msg}\n\n"
+                    f"🔗 Put牆：{top_put_str or '—'}\n"
+                    f"🔗 Call牆：{top_call_str or '—'}\n")
+        if put_note:  line_msg += f"{put_note}\n"
+        if call_note: line_msg += f"{call_note}\n"
+        if exp_line:  line_msg += f"\n{exp_line}"
 
         line_preview = html.Div([
-            html.Div("📱 LINE 訊息預覽", style={"fontSize":"12px","fontWeight":"500",
-                     "color":"#1a1a1a","marginBottom":"8px"}),
+            html.Div("📱 LINE 訊息預覽", style={"fontSize":"12px","fontWeight":"500","marginBottom":"8px"}),
             html.Pre(line_msg, style={"fontSize":"12px","color":"#333","whiteSpace":"pre-wrap",
                      "background":"#f5f5f3","borderRadius":"8px","padding":"10px 12px",
                      "margin":"0 0 8px","fontFamily":"sans-serif","lineHeight":"1.6"}),
@@ -3926,10 +3911,51 @@ def update_options(n_clicks, ticker_input):
         ], style={"border":"0.5px solid #e5e5e5","borderRadius":"10px","padding":"12px 14px",
                   "background":"white","marginBottom":"10px"})
 
-        return html.Div([spot_label, conf_card, sug_box, line_preview, dual_box] + exp_cards)
+        spot_label = html.Div(f"📍 {ticker} 現價：${spot:.2f}",
+                               style={"fontSize":"14px","fontWeight":"500","color":"#1a1a1a","marginBottom":"10px"})
+
+        # Gamma 圖
+        gamma_chart = html.Div(
+            dcc.Graph(figure=fig_gamma, config={"displayModeBar":False}),
+            style={"border":"0.5px solid #e5e5e5","borderRadius":"10px","overflow":"hidden",
+                   "background":"white","marginBottom":"10px"})
+
+        # 各到期日卡片（簡化版）
+        exp_cards = []
+        for ed in exp_data[:4]:
+            gamma_flag = "⚠️ Gamma高峰" if ed["is_gamma"] else ""
+            opex_flag  = "📅 月結算" if ed["is_opex"] else ""
+            cat_color  = {"0DTE":"#dc2626","Weekly":"#d97706","Monthly":"#2563eb","LEAPS":"#888"}.get(ed["cat"],"#888")
+            exp_cards.append(html.Div([
+                html.Div([
+                    html.Span(f"[{ed['cat']}] {ed['exp']}",
+                              style={"fontWeight":"500","fontSize":"13px","color":cat_color}),
+                    html.Span(f"  {ed['days']}天後　{opex_flag} {gamma_flag}",
+                              style={"fontSize":"11px","color":"#aaa","marginLeft":"8px"}),
+                ], style={"marginBottom":"6px"}),
+                html.Div([
+                    html.Div([
+                        html.Div("Put牆（支撐）",style={"fontSize":"10px","color":"#0F6E56","marginBottom":"3px"}),
+                        *[html.Div(f"${r[0]:.0f}　OI {r[1]:,.0f}",
+                                   style={"fontSize":"12px","marginBottom":"2px"}) for r in ed["top_puts"][:3]],
+                    ], style={"flex":"1"}),
+                    html.Div([
+                        html.Div("Call牆（阻力）",style={"fontSize":"10px","color":"#A32D2D","marginBottom":"3px"}),
+                        *[html.Div(f"${r[0]:.0f}　OI {r[1]:,.0f}",
+                                   style={"fontSize":"12px","marginBottom":"2px"}) for r in ed["top_calls"][:3]],
+                    ], style={"flex":"1"}),
+                ], style={"display":"flex","gap":"16px"}),
+            ], style={"background":"white","borderRadius":"10px","padding":"12px 14px",
+                      "border":"0.5px solid #e5e5e5","marginBottom":"8px"}))
+
+        return html.Div([
+            spot_label, warn_box, conf_card, dte_cards,
+            sug_box, gamma_chart, line_preview, dual_box,
+        ] + exp_cards)
 
     except Exception as e:
         return html.P(f"錯誤：{e}", style={"color":"#dc2626","fontSize":"13px"})
+
 
 
 @app.callback(
