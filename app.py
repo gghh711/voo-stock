@@ -1640,6 +1640,8 @@ def build_option_line_msg(ticker):
             ed   = datetime.date.fromisoformat(e)
             days = (ed - today).days
             try:
+                import time
+                time.sleep(0.5)
                 chain = t.option_chain(e)
                 puts  = chain.puts[["strike","openInterest"]].dropna()
                 calls = chain.calls[["strike","openInterest"]].dropna()
@@ -3670,11 +3672,13 @@ def update_options(n_clicks, ticker_input):
         exp_data  = []
         short_term_count = 0  # 0DTE + Weekly 合約數
 
-        for exp_info in all_exps[:6]:  # 最多抓6個到期日
+        for exp_info in all_exps[:3]:  # 最多抓3個到期日（避免限流）
             e    = exp_info["exp"]
             days = exp_info["days"]
             cat  = exp_info["cat"]
             try:
+                import time
+                time.sleep(0.5)  # 每次請求間隔 0.5 秒
                 chain = t.option_chain(e)
                 puts  = chain.puts[["strike","openInterest","impliedVolatility"]].dropna()
                 calls = chain.calls[["strike","openInterest","impliedVolatility"]].dropna()
@@ -3954,7 +3958,15 @@ def update_options(n_clicks, ticker_input):
         ] + exp_cards)
 
     except Exception as e:
-        return html.P(f"錯誤：{e}", style={"color":"#dc2626","fontSize":"13px"})
+        err_str = str(e)
+        if "Rate" in err_str or "429" in err_str or "Too Many" in err_str:
+            return html.Div([
+                html.P("⏳ Yahoo Finance 請求次數過多（Rate Limited）",
+                       style={"color":"#d97706","fontSize":"14px","fontWeight":"500"}),
+                html.P("請等待 1-2 分鐘後再試，或減少查詢頻率。",
+                       style={"color":"#888","fontSize":"13px"}),
+            ])
+        return html.P(f"錯誤：{err_str}", style={"color":"#dc2626","fontSize":"13px"})
 
 
 
