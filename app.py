@@ -1525,6 +1525,83 @@ def asia_slope_block(display, closes, window):
     extra = f"　{ret5_str}　｜　{nh_str}"
     return base + "\n" + extra
 
+def backtest_option_walls(ticker, put_walls, call_walls, touch_pct=0.005, fwd_days=3):
+    """
+    用歷史股價驗證期權牆有效性
+    put_walls  : list of strike prices（支撐位）
+    call_walls : list of strike prices（阻力位）
+    touch_pct  : 觸碰門檻，股價距離牆 ±0.5% 內視為觸碰
+    fwd_days   : 觸碰後觀察幾天
+    回傳 dict of results
+    """
+    end_dt   = datetime.datetime.now(tz=timezone.utc)
+    start_dt = end_dt - datetime.timedelta(days=365)
+    try:
+        dates, closes, _, _ = fetch_yahoo_range(ticker, start_dt, end_dt, "1d")
+    except:
+        return None
+
+    if len(closes) < fwd_days + 5:
+        return None
+
+    results = {"put_walls": {}, "call_walls": {}}
+
+    for wall in put_walls:
+        touches = []
+        for i in range(len(closes) - fwd_days):
+            price = closes[i]
+            # 觸碰：股價從上方接近牆（price 在牆的 touch_pct 範圍內）
+            if wall * (1 - touch_pct) <= price <= wall * (1 + touch_pct):
+                fwd_ret = (closes[i + fwd_days] - price) / price * 100
+                bounced = fwd_ret > 0  # 反彈（支撐有效）
+                broken  = closes[i + fwd_days] < wall * (1 - touch_pct * 3)  # 跌破牆
+                touches.append({
+                    "date": dates[i],
+                    "price": round(price, 2),
+                    "fwd_ret": round(fwd_ret, 2),
+                    "bounced": bounced,
+                    "broken": broken,
+                })
+        if touches:
+            bounce_rate = sum(1 for t in touches if t["bounced"]) / len(touches) * 100
+            break_rate  = sum(1 for t in touches if t["broken"])  / len(touches) * 100
+            results["put_walls"][wall] = {
+                "touches": touches,
+                "count": len(touches),
+                "bounce_rate": round(bounce_rate, 1),
+                "break_rate":  round(break_rate,  1),
+                "valid": bounce_rate >= 50,
+            }
+
+    for wall in call_walls:
+        touches = []
+        for i in range(len(closes) - fwd_days):
+            price = closes[i]
+            if wall * (1 - touch_pct) <= price <= wall * (1 + touch_pct):
+                fwd_ret = (closes[i + fwd_days] - price) / price * 100
+                rejected = fwd_ret < 0   # 回調（阻力有效）
+                broken   = closes[i + fwd_days] > wall * (1 + touch_pct * 3)  # 突破牆
+                touches.append({
+                    "date": dates[i],
+                    "price": round(price, 2),
+                    "fwd_ret": round(fwd_ret, 2),
+                    "rejected": rejected,
+                    "broken": broken,
+                })
+        if touches:
+            reject_rate = sum(1 for t in touches if t["rejected"]) / len(touches) * 100
+            break_rate  = sum(1 for t in touches if t["broken"])   / len(touches) * 100
+            results["call_walls"][wall] = {
+                "touches": touches,
+                "count": len(touches),
+                "reject_rate": round(reject_rate, 1),
+                "break_rate":  round(break_rate,  1),
+                "valid": reject_rate >= 50,
+            }
+
+    return results
+
+
 def calc_option_confidence(all_puts, all_calls, exp_data, spot, dual_puts, dual_calls):
     """
     計算期權數據信心度
@@ -3633,14 +3710,54 @@ def update_options(n_clicks, ticker_input):
     ticker = (ticker_input or "QQQ").strip().upper()
 
     try:
-        import yfinance as yf
         import math as _math
+        import time
 
-        t    = yf.Ticker(ticker)
-        spot = t.fast_info.get("lastPrice") or t.fast_info.last_price
-        exps = t.options
+        OPT_HEADERS = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Referer": "https://finance.yahoo.com",
+        }
+
+        def get_yahoo_crumb():
+            """取得 Yahoo Finance crumb（認證 token）"""
+            s = requests.Session()
+            # 先取 Cookie
+            s.get("https://finance.yahoo.com", headers=OPT_HEADERS, timeout=10)
+            # 取 crumb
+            r = s.get("https://query2.finance.yahoo.com/v1/test/getcrumb",
+                      headers=OPT_HEADERS, timeout=10)
+            crumb = r.text.strip()
+            return s, crumb
+
+        def fetch_spot(tkr):
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{tkr}?interval=1d&range=1d"
+            r   = requests.get(url, headers=OPT_HEADERS, timeout=10)
+            return r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+
+        def fetch_expirations_and_chain(tkr, exp_ts=None):
+            s, crumb = get_yahoo_crumb()
+            url = f"https://query2.finance.yahoo.com/v7/finance/options/{tkr}?crumb={crumb}"
+            if exp_ts:
+                url += f"&date={exp_ts}"
+            r = s.get(url, headers=OPT_HEADERS, timeout=15)
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+            result = r.json()["optionChain"]["result"][0]
+            exps   = [datetime.datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+                      for ts in result.get("expirationDates", [])]
+            opts   = result.get("options", [{}])[0]
+            puts   = opts.get("puts",  [])
+            calls  = opts.get("calls", [])
+            return exps, puts, calls
+
+        spot = fetch_spot(ticker)
+        # 第一次抓：取到期日清單 + 近月 chain
+        exps, first_puts, first_calls = fetch_expirations_and_chain(ticker)
         if not exps:
-            return html.P("無法取得期權數據", style={"color":"#aaa","fontSize":"13px"})
+            return html.P("無法取得期權到期日", style={"color":"#aaa","fontSize":"13px"})
+
 
         today = datetime.date.today()
 
@@ -3677,53 +3794,56 @@ def update_options(n_clicks, ticker_input):
             days = exp_info["days"]
             cat  = exp_info["cat"]
             try:
-                import time
-                time.sleep(0.5)
-                chain = t.option_chain(e)
+                time.sleep(0.8)
+                ed_obj = datetime.date.fromisoformat(e)
+                ts     = int(datetime.datetime(ed_obj.year, ed_obj.month, ed_obj.day,
+                                               tzinfo=timezone.utc).timestamp())
+                # 如果是第一個到期日，直接用已抓的
+                if exp_info == all_exps[0] and first_puts is not None:
+                    raw_puts_list  = first_puts
+                    raw_calls_list = first_calls
+                else:
+                    _, raw_puts_list, raw_calls_list = fetch_expirations_and_chain(ticker, ts)
 
-                # ── 診斷：檢查原始 chain ──
-                raw_puts  = chain.puts
-                raw_calls = chain.calls
-                print(f"[期權診斷] {e} 原始 puts={len(raw_puts)} calls={len(raw_calls)}")
-                if len(raw_puts) > 0:
-                    print(f"  Put  OI={raw_puts['openInterest'].min():.0f}~{raw_puts['openInterest'].max():.0f}"
-                          f"  K=${raw_puts['strike'].min():.0f}~${raw_puts['strike'].max():.0f}")
-                if len(raw_calls) > 0:
-                    print(f"  Call OI={raw_calls['openInterest'].min():.0f}~{raw_calls['openInterest'].max():.0f}"
-                          f"  K=${raw_calls['strike'].min():.0f}~${raw_calls['strike'].max():.0f}")
-                if raw_puts.empty and raw_calls.empty:
-                    print(f"  ⚠️ {e} chain 完全空白，API 問題")
+                print(f"[期權診斷] {e} 原始 puts={len(raw_puts_list)} calls={len(raw_calls_list)}")
+
+                if not raw_puts_list and not raw_calls_list:
+                    print(f"  ⚠️ {e} chain 空白，跳過")
                     continue
 
-                puts  = raw_puts[["strike","openInterest","impliedVolatility"]].dropna()
-                calls = raw_calls[["strike","openInterest","impliedVolatility"]].dropna()
-                print(f"  dropna後 puts={len(puts)} calls={len(calls)}")
+                # 轉成 dict list → 提取欄位
+                def parse_contracts(contracts):
+                    rows = []
+                    for c in contracts:
+                        k  = c.get("strike", 0)
+                        oi = c.get("openInterest", 0)
+                        iv = c.get("impliedVolatility", 0)
+                        if k and oi is not None and iv is not None:
+                            rows.append({"strike": float(k), "openInterest": float(oi), "impliedVolatility": float(iv)})
+                    return rows
+
+                puts_rows  = parse_contracts(raw_puts_list)
+                calls_rows = parse_contracts(raw_calls_list)
+                print(f"  解析後 puts={len(puts_rows)} calls={len(calls_rows)}")
 
                 # 過濾：OI > 100 且 ±15% 範圍
-                puts  = puts[(puts["openInterest"] > 100) &
-                             (puts["strike"] >= spot * 0.85) &
-                             (puts["strike"] <= spot * 1.15)]
-                calls = calls[(calls["openInterest"] > 100) &
-                              (calls["strike"] >= spot * 0.85) &
-                              (calls["strike"] <= spot * 1.15)]
-                print(f"  過濾後 puts={len(puts)} calls={len(calls)} "
-                      f"(現價${spot:.0f} 範圍${spot*0.85:.0f}~${spot*1.15:.0f})")
-
+                puts_rows  = [r for r in puts_rows  if r["openInterest"] > 100 and spot*0.85 <= r["strike"] <= spot*1.15]
+                calls_rows = [r for r in calls_rows if r["openInterest"] > 100 and spot*0.85 <= r["strike"] <= spot*1.15]
+                print(f"  過濾後 puts={len(puts_rows)} calls={len(calls_rows)} (現價${spot:.0f} ±15%)")
 
                 if cat in ("0DTE","Weekly"):
-                    short_term_count += len(puts) + len(calls)
+                    short_term_count += len(puts_rows) + len(calls_rows)
 
                 # 加權 OI（LEAPS 權重 0.5，其他全重）
                 weight = 0.5 if cat == "LEAPS" else 1.0
                 T = max(days/365, 1/365)
 
-                for _, row in puts.iterrows():
+                for row in puts_rows:
                     k  = row["strike"]
                     oi = row["openInterest"] * weight
                     iv = row["impliedVolatility"]
                     ALL_PUTS.setdefault(k, {"oi":0,"gex":0})
                     ALL_PUTS[k]["oi"] += oi
-                    # Gamma
                     if iv > 0:
                         try:
                             d1    = (_math.log(spot/k) + 0.5*iv*iv*T) / (iv*_math.sqrt(T))
@@ -3731,7 +3851,7 @@ def update_options(n_clicks, ticker_input):
                             ALL_PUTS[k]["gex"] -= gamma * oi * 100 * spot * spot * 0.01
                         except: pass
 
-                for _, row in calls.iterrows():
+                for row in calls_rows:
                     k  = row["strike"]
                     oi = row["openInterest"] * weight
                     iv = row["impliedVolatility"]
@@ -3744,10 +3864,12 @@ def update_options(n_clicks, ticker_input):
                             ALL_CALLS[k]["gex"] += gamma * oi * 100 * spot * spot * 0.01
                         except: pass
 
+                top_puts_sorted  = sorted(puts_rows,  key=lambda r: r["openInterest"], reverse=True)[:5]
+                top_calls_sorted = sorted(calls_rows, key=lambda r: r["openInterest"], reverse=True)[:5]
                 exp_data.append({**exp_info,
-                    "top_puts":  puts.nlargest(5,"openInterest")[["strike","openInterest"]].values.tolist(),
-                    "top_calls": calls.nlargest(5,"openInterest")[["strike","openInterest"]].values.tolist(),
-                    "put_count": len(puts), "call_count": len(calls),
+                    "top_puts":  [[r["strike"],r["openInterest"]] for r in top_puts_sorted],
+                    "top_calls": [[r["strike"],r["openInterest"]] for r in top_calls_sorted],
+                    "put_count": len(puts_rows), "call_count": len(calls_rows),
                 })
             except: continue
 
@@ -3971,9 +4093,87 @@ def update_options(n_clicks, ticker_input):
             ], style={"background":"white","borderRadius":"10px","padding":"12px 14px",
                       "border":"0.5px solid #e5e5e5","marginBottom":"8px"}))
 
+        # ── Step 9：歷史回測驗證 ──
+        put_wall_prices  = [k for k,_ in (dual_puts  or support_strikes)[:3]]
+        call_wall_prices = [k for k,_ in (dual_calls or resist_strikes)[:3]]
+        bt = backtest_option_walls(ticker, put_wall_prices, call_wall_prices)
+
+        bt_box = html.Div()
+        if bt:
+            bt_rows_put  = []
+            bt_rows_call = []
+
+            for wall, res in bt["put_walls"].items():
+                valid_color = "#0F6E56" if res["valid"] else "#A32D2D"
+                bt_rows_put.append(html.Tr([
+                    html.Td(f"${wall:.0f}", style={"padding":"5px 10px","fontWeight":"500"}),
+                    html.Td(f"{res['count']} 次",  style={"padding":"5px 10px","textAlign":"right"}),
+                    html.Td(f"{res['bounce_rate']}%",
+                            style={"padding":"5px 10px","textAlign":"right",
+                                   "fontWeight":"500","color":valid_color}),
+                    html.Td(f"{res['break_rate']}%",
+                            style={"padding":"5px 10px","textAlign":"right","color":"#A32D2D"}),
+                    html.Td("✅ 有效" if res["valid"] else "❌ 偏弱",
+                            style={"padding":"5px 10px","color":valid_color}),
+                    html.Td(res["touches"][-1]["date"] if res["touches"] else "—",
+                            style={"padding":"5px 10px","fontSize":"11px","color":"#aaa"}),
+                ], style={"borderBottom":"0.5px solid #f5f5f5"}))
+
+            for wall, res in bt["call_walls"].items():
+                valid_color = "#0F6E56" if res["valid"] else "#A32D2D"
+                bt_rows_call.append(html.Tr([
+                    html.Td(f"${wall:.0f}", style={"padding":"5px 10px","fontWeight":"500"}),
+                    html.Td(f"{res['count']} 次",  style={"padding":"5px 10px","textAlign":"right"}),
+                    html.Td(f"{res['reject_rate']}%",
+                            style={"padding":"5px 10px","textAlign":"right",
+                                   "fontWeight":"500","color":valid_color}),
+                    html.Td(f"{res['break_rate']}%",
+                            style={"padding":"5px 10px","textAlign":"right","color":"#A32D2D"}),
+                    html.Td("✅ 有效" if res["valid"] else "❌ 偏弱",
+                            style={"padding":"5px 10px","color":valid_color}),
+                    html.Td(res["touches"][-1]["date"] if res["touches"] else "—",
+                            style={"padding":"5px 10px","fontSize":"11px","color":"#aaa"}),
+                ], style={"borderBottom":"0.5px solid #f5f5f5"}))
+
+            th = {"padding":"5px 10px","fontSize":"11px","color":"#888",
+                  "borderBottom":"1px solid #eee","textAlign":"right"}
+            th_l = {**th,"textAlign":"left"}
+
+            def make_bt_table(rows, title, color, col3_label):
+                if not rows:
+                    return html.Div(html.P(f"{title}：無觸碰記錄",
+                                          style={"fontSize":"12px","color":"#aaa"}))
+                return html.Div([
+                    html.Div(title, style={"fontSize":"12px","fontWeight":"500",
+                                          "color":color,"marginBottom":"6px"}),
+                    html.Div(html.Table([
+                        html.Thead(html.Tr([
+                            html.Th("牆位置",style=th_l),
+                            html.Th("觸碰次數",style=th),
+                            html.Th(col3_label,style=th),
+                            html.Th("穿透率",style=th),
+                            html.Th("評估",style=th),
+                            html.Th("最近觸碰",style=th),
+                        ], style={"background":"#f9f9f9"})),
+                        html.Tbody(rows),
+                    ], style={"width":"100%","borderCollapse":"collapse","fontSize":"12px"}),
+                    style={"overflowX":"auto"}),
+                ])
+
+            bt_box = html.Div([
+                html.Div("📈 歷史回測驗證（過去1年）",
+                         style={"fontSize":"13px","fontWeight":"500","color":"#1a1a1a","marginBottom":"8px"}),
+                html.P(f"觸碰門檻 ±0.5%，觸碰後觀察 3 天，反彈/回調率 ≥50% 視為有效",
+                       style={"fontSize":"11px","color":"#aaa","margin":"0 0 10px"}),
+                make_bt_table(bt_rows_put,  "🟢 Put牆（支撐位）反彈率", "#0F6E56", "反彈率"),
+                html.Div(style={"height":"8px"}),
+                make_bt_table(bt_rows_call, "🔴 Call牆（阻力位）回調率", "#A32D2D", "回調率"),
+            ], style={"border":"0.5px solid #e5e5e5","borderRadius":"10px",
+                      "padding":"12px 14px","background":"white","marginBottom":"10px"})
+
         return html.Div([
             spot_label, warn_box, conf_card, dte_cards,
-            sug_box, gamma_chart, line_preview, dual_box,
+            sug_box, gamma_chart, bt_box, line_preview, dual_box,
         ] + exp_cards)
 
     except Exception as e:
